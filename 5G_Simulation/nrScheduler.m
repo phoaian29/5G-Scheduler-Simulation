@@ -1,0 +1,3137 @@
+classdef nrScheduler < handle & comm.internal.ConfigBase
+    %nrScheduler Implements physical uplink shared channel (PUSCH) and physical downlink shared channel (PDSCH) resource scheduling
+    %   The class implements uplink (UL) and downlink (DL) scheduling for both
+    %   FDD and TDD modes. Scheduling is only done at slot boundary when start
+    %   symbol is DL so that output (scheduling decisions) can be immediately
+    %   conveyed to UEs in DL direction, assuming zero run time for scheduler
+    %   algorithm. Scheduling decisions are based on selected scheduling
+    %   strategy, scheduler configuration and the context (buffer status,
+    %   served data rate, channel conditions and pending retransmissions)
+    %   maintained for each UE. The information available to scheduler for
+    %   making scheduling decisions is present as various properties of this
+    %   class.
+
+    %   Copyright 2022-2024 The MathWorks, Inc.
+
+    properties (SetAccess = protected)
+        %CellConfig Cell configuration
+        CellConfig
+
+        %UEContext Context of all the connected UEs.
+        % This is a vector of nr5g.internal.nrUEContext of length equal to
+        % the number of UEs connected to the gNB. Value at index 'i' stores
+        % the context of a UE with RNTI 'i'.
+        UEContext
+    end
+
+    properties (SetAccess = protected, Hidden)
+        %NumUEs Total number of UEs connected to the gNB
+        NumUEs=0;
+
+        %UserPairingMatrix Precomputed orthogonality matrix for all UEs based on the
+        % CSI type II reports
+        UserPairingMatrix
+
+        %CurrFrame Frame number at the time of scheduler invocation
+        CurrFrame = 0;
+
+        %CurrSlot Current running slot number in the 10 ms frame at the time of scheduler invocation
+        CurrSlot = 0;
+
+        %CurrSymbol Current running symbol of the current slot at the time of scheduler invocation
+        CurrSymbol = 0;
+
+        %LastSelectedUEUL The RNTI of UE which was assigned the last scheduled uplink resource
+        LastSelectedUEUL = 0;
+
+        %LastSelectedUEDL The RNTI of UE which was assigned the last scheduled downlink resource
+        LastSelectedUEDL = 0;
+
+        %Type1SinglePanelCodebook Type-1 single panel precoding matrix codebook
+        Type1SinglePanelCodebook = []
+
+        %PUSCHConfig nrPUSCHConfig object
+        PUSCHConfig
+
+        %PDSCHConfig nrPDSCHConfig object
+        PDSCHConfig
+
+        %CDMGroupsInUseUL Number of CDM groups in use for UL direction
+        CDMGroupsInUseUL
+
+        %CDMGroupsInUseDL Number of CDM groups in use for DL direction
+        CDMGroupsInUseDL
+
+        %CarrierConfigUL nrCarrierConfig object for UL
+        CarrierConfigUL
+
+        %CarrierConfigDL nrCarrierConfig object for DL
+        CarrierConfigDL
+
+        %TimeFrequencyResourceStruct Structure representing time-frequency resources of a TTI
+        TimeFrequencyResourceStruct = struct(GNBCarrierIndex=0, NFrame=0, NSlot=0, SymbolAllocation=[0 0], FrequencyResource=[]);
+
+        %ULGrantArrayStruct Pre-allocated UL grant struct array for custom scheduling grants
+        % Grant contains customizable fields which are subset of UL grant fields
+        % denoted by 'ULGrantInfoStruct'. These are to be filled by someone writing
+        % custom UL scheduling strategy. In 'configureScheduler' function the
+        % initialization is done to create an array for maximum number of users
+        % supported per TTI
+        ULGrantArrayStruct = struct('RNTI',[],'FrequencyAllocation',[], ...
+            'MCSIndex',[],'NumLayers',[],'TPMI',[],'NumAntennaPorts',[]);
+
+        %DLGrantArrayStruct Pre-allocated DL grant struct array for custom scheduling grants
+        % Similar description as for 'ULGrantArrayStruct' applies with respect to
+        % DL direction. In 'configureScheduler' function the initialization is done
+        % to create an array for maximum number of users supported per TTI
+        DLGrantArrayStruct = struct('RNTI',[],'FrequencyAllocation',[], 'MCSIndex',[], ...
+            'W',[]);
+
+        %SchedulingInfoStruct Dynamic scheduling information structure format
+        SchedulingInfoStruct = struct(EligibleUEs=[], MaxNumUsersTTI=[]);
+
+        %IsSingleCarrierFormatNewTxDL Signature format for scheduleNewTransmissionsDL method of scheduler object (in-built or custom scheduler)
+        % Value 1 means single-carrier signature with 4 inputs and value 0 means
+        % multi-carrier compatible signature with 3 inputs.
+        IsSingleCarrierFormatNewTxDL
+
+        %IsSingleCarrierFormatNewTxUL Signature format for scheduleNewTransmissionsUL method of scheduler object (in-built or custom scheduler)
+        % Value 1 means single-carrier signature with 4 inputs and value 0 means
+        % multi-carrier compatible signature with 3 inputs.
+        IsSingleCarrierFormatNewTxUL
+    end
+
+    properties (Hidden)
+        %EnableSchedulingValidation Flag to enable or disable grant validation
+        EnableSchedulingValidation = true
+
+        %SchedulerConfig Scheduler configuration
+        SchedulerConfig
+
+        %CQITableUL CQI table used for uplink
+        % It contains the mapping of CQI indices with Modulation and Coding
+        % schemes
+        CQITableUL
+
+        %MCSTableUL MCS table used for uplink
+        % It contains the mapping of MCS indices with Modulation and Coding
+        % schemes
+        MCSTableUL
+
+        %CQITableDL CQI table used for downlink
+        % It contains the mapping of CQI indices with Modulation and Coding
+        % schemes
+        CQITableDL
+
+        %MCSTableDL MCS table used for downlink
+        % It contains the mapping of MCS indices with Modulation and Coding
+        % schemes
+        MCSTableDL
+
+        %NumHARQ Number of HARQ processes
+        NumHARQ
+
+        %PUSCHPreparationTime PUSCH preparation time in terms of number of symbols
+        % Scheduler ensures that PUSCH grant arrives at UEs at least these
+        % many symbols before the transmission time
+        PUSCHPreparationTime (1,1) {mustBeInteger, mustBeNonnegative}
+
+        %RBAllocationLimitUL Maximum limit on number of RBs that can be allotted for a PUSCH
+        % The limit is applicable for new PUSCH transmissions and not for
+        % retransmissions
+        RBAllocationLimitUL {mustBeInteger, mustBeInRange(RBAllocationLimitUL, 1, 275)}
+
+        %RBAllocationLimitDL Maximum limit on number of RBs that can be allotted for a PDSCH
+        % The limit is applicable for new PDSCH transmissions and not for
+        % retransmissions
+        RBAllocationLimitDL {mustBeInteger, mustBeInRange(RBAllocationLimitDL, 1, 275)}
+
+        %RBGSizeConfig Number of RBs in an RBG.
+        % RBGSizeConfig as 1 (configuration-1 RBG table) or 2 (configuration-2 RBG
+        % table) as defined in 3GPP TS 38.214 Section 5.1.2.2.1.
+        RBGSizeConfig (1, 1) {mustBeMember(RBGSizeConfig, [1, 2])} = 1;
+
+        %PUSCHDMRSConfigurationType PUSCH DM-RS configuration type (1 or 2)
+        PUSCHDMRSConfigurationType (1,1) {mustBeMember(PUSCHDMRSConfigurationType, [1, 2])} = 1;
+
+        %PUSCHDMRSLength PUSCH demodulation reference signal (DM-RS) length
+        PUSCHDMRSLength (1, 1) {mustBeMember(PUSCHDMRSLength, [1, 2])} = 1;
+
+        %PUSCHDMRSAdditionalPosTypeA Additional PUSCH DM-RS positions for type A (0..3)
+        PUSCHDMRSAdditionalPosTypeA (1, 1) {mustBeMember(PUSCHDMRSAdditionalPosTypeA, [0, 1, 2, 3])} = 0;
+
+        %PUSCHDMRSAdditionalPosTypeB Additional PUSCH DM-RS positions for type B (0..3)
+        PUSCHDMRSAdditionalPosTypeB (1, 1) {mustBeMember(PUSCHDMRSAdditionalPosTypeB, [0, 1, 2, 3])} = 0;
+
+        %PDSCHDMRSConfigurationType PDSCH DM-RS configuration type (1 or 2)
+        PDSCHDMRSConfigurationType (1,1) {mustBeMember(PDSCHDMRSConfigurationType, [1, 2])} = 1;
+
+        %PDSCHDMRSLength PDSCH demodulation reference signal (DM-RS) length
+        PDSCHDMRSLength (1, 1) {mustBeMember(PDSCHDMRSLength, [1, 2])} = 1;
+
+        %PDSCHDMRSAdditionalPosTypeA Additional PDSCH DM-RS positions for type A (0..3)
+        PDSCHDMRSAdditionalPosTypeA (1, 1) {mustBeMember(PDSCHDMRSAdditionalPosTypeA, [0, 1, 2, 3])} = 0;
+
+        %PDSCHDMRSAdditionalPosTypeB Additional PDSCH DM-RS positions for type B (0 or 1)
+        PDSCHDMRSAdditionalPosTypeB (1, 1) {mustBeMember(PDSCHDMRSAdditionalPosTypeB, [0, 1])} = 0;
+
+        %TTIGranularity Minimum time-domain assignment in terms of number of symbols (for symbol based scheduling).
+        % The default value is 4 symbols
+        TTIGranularity {mustBeMember(TTIGranularity, [2, 4, 7])} = 4;
+    end
+
+    properties (Constant, Hidden)
+        %DLType Value to specify downlink direction or downlink symbol type
+        DLType = nr5g.internal.MACConstants.DLType;
+
+        %ULType Value to specify uplink direction or uplink symbol type
+        ULType = nr5g.internal.MACConstants.ULType;
+
+        %SchedulerInputStruct Format of the context that will be sent to the scheduling strategy
+        SchedulerInputStruct = struct('linkDir', [], 'eligibleUEs', [], 'selectedRank', [], 'bufferStatus', [], ...
+            'lastSelectedUE', [], 'channelQuality', [], 'freqOccupancyBitmap', [], 'rbAllocationLimit', [], 'rbRequirement', [], 'numSym', []);
+
+        %ULGrantInfoStruct Format of the UL grant information
+        ULGrantInfoStruct = struct('RNTI',[],'GNBCarrierIndex',[],'Type',[],'HARQID',[],'ResourceAllocationType',[],'FrequencyAllocation',[], ...
+            'StartSymbol',[],'NumSymbols',[],'SlotOffset',[],'MCSIndex',[],'NDI',[], ...
+            'DMRSLength',[],'MappingType',[],'NumLayers',[],'NumCDMGroupsWithoutData',[], ...
+            'NumAntennaPorts',[],'TPMI',[],'RV',[],'PRBSet',[]);
+
+        %DLAssignmentInfoStruct Format of the DL assignment information
+        DLAssignmentInfoStruct = struct('RNTI',[],'GNBCarrierIndex',[],'Type',[],'HARQID',[],'ResourceAllocationType',[],'FrequencyAllocation',[], ...
+            'StartSymbol',[],'NumSymbols',[],'SlotOffset',[],'MCSIndex',[],'NDI',[], ...
+            'DMRSLength',[],'MappingType',[],'NumLayers',[],'NumCDMGroupsWithoutData',[], ...
+            'BeamIndex',[],'W',[],'FeedbackSlotOffset',[],'RV',[],'PRBSet',[]);
+    end
+
+    methods (Access = protected)
+        function dlAssignments = scheduleNewTransmissionsDL(obj, timeFrequencyResource, schedulingInfo)
+            %scheduleNewTransmissionsDL Assign resources for new DL transmissions in a transmission time interval (TTI)
+            %   DLASSIGNMENTS = scheduleNewTransmissionsDL(OBJ, TIMEFREQUENCYRESOURCE,
+            %   SCHEDULINGINFO) assigns the time and frequency resources defined by
+            %   TIMEFREQUENCYRESOURCE to different UEs for new transmissions. The
+            %   scheduler invokes this function after satisfying the retransmission
+            %   requirements for UEs, if any. As a result, not all frequency resources
+            %   of the bandwidth would be available for new transmission scheduling in
+            %   this TTI.
+            %
+            %   TIMEFREQUENCYRESOURCE represents the TTI i.e., the time symbols and the
+            %   frequency resources which this method is scheduling. It is a vector of
+            %   structures with structure elements representing time-frequency
+            %   resources of different carriers which scheduler is jointly scheduling.
+            %   Each structure element contains following fields:
+            %     GNBCarrierIndex - Index of the scheduled carrier in the obj.CellConfig vector. The
+            %                       CellConfig property lists all the carriers which gNB
+            %                       operates upon.
+            %     NFrame - Absolute frame number of the symbols getting scheduled
+            %     NSlot - The slot number in the frame 'NFrame' whose symbols are getting scheduled
+            %     SymbolAllocation - TTI symbol range as a vector of two integers: [StartSym NumSym]
+            %                     StartSym - Start symbol number (in the slot 'NSlot' of the frame 'NFrame') of the TTI getting scheduled
+            %                     NumSym - Number of symbols getting scheduled
+            %                     All the DL assignments generated as output for this
+            %                     carrier span over this symbol range.
+            %     FrequencyResource - It represents the frequency resources getting scheduled.
+            %                         It is a bit vector as per following description.
+            %                         If resource allocation type (See
+            %                         'ResourceAllocationType' N-V parameter of
+            %                         nrGNB.configureScheduler) is 1 (i.e., RAT-1) then
+            %                         it is a bit vector of length equal to number of
+            %                         RBs in the DL bandwidth. If resource allocation
+            %                         type is 0 (i.e., RAT-0) then it is a bit vector of
+            %                         length equal to number of RBGs in the DL
+            %                         bandwidth. Value 0 at an index in the bit vector
+            %                         means that the corresponding RB/RBG is available
+            %                         for scheduling, otherwise, it is considered
+            %                         unavailable for scheduling. If all the frequency
+            %                         resources in a TTI are consumed by
+            %                         retransmissions, then scheduler does not invoke
+            %                         this function for that TTI.
+            %
+            %   Value of NFrame, NSlot and StartSym (in SymbolAllocation) is 0-based.
+            %
+            %   SCHEDULINGINFO contains information to be used for scheduling. It is a
+            %   vector of structures of same length as TIMEFREQUENCYRESOURCE. A structure element
+            %   contains information for the specific carrier which is present at the corresponding
+            %   index in TIMEFREQUENCYRESOURCE. Each structure element has following fields:
+            %   EligibleUEs - The set of eligible UEs for allocation in this TTI on this carrier. It is
+            %                 a vector of RNTI of the UEs. This set includes all the
+            %                 UEs connected to the gNB excluding the ones which match
+            %                 either of these criteria:
+            %                 (1) The UE is scheduled for retransmission in this TTI.
+            %                 (2) The UE does not have any queued data.
+            %                 (3) All the HARQ processes are blocked for the UE.
+            %                 If due to these criteria, none of the UEs qualify
+            %                 as eligible for the carrier then scheduler excludes that
+            %                 carrier for scheduling from TIMEFREQUENCYRESOURCE.
+            %   MaxNumUsersTTI - Maximum number of UEs which can be scheduled in the
+            %                    TTI for new transmissions. The value is adjusted for
+            %                    the retransmissions scheduled in this TTI i.e., the
+            %                    value is count of UEs scheduled for retransmissions in
+            %                    this TTI subtracted from total maximum allowed users
+            %                    in a TTI (See MaxNumUsersPerTTI N-V parameter of
+            %                    nrGNB.configureScheduler). If this value comes out to
+            %                    be zero then scheduler excludes this carrier for
+            %                    scheduling from TIMEFREQUENCYRESOURCE.
+            %
+            %   Note that in addition to information in SCHEDULINGINFO, any other context
+            %   in scheduler object, OBJ, can be used as information to decide resource allocation
+            %   to UEs.
+            %
+            %   DLASSIGNMENTS is a struct vector where each element represents DL assignment for a PDSCH, and
+            %   has following information as fields:
+            %   RNTI - Downlink assignment is for this UE
+            %   GNBCarrierIndex - The carrier corresponding to this downlink assignment.
+            %                  It is index of the carrier in CellConfig property. The
+            %                  CellConfig property lists all the carriers which gNB
+            %                  operates upon.
+            %   FrequencyAllocation - For RAT-0, a bit vector of length equal to number
+            %                         of RBGs in the DL bandwidth. Value 1
+            %                         at an index means that corresponding
+            %                         RBG is assigned for the grant
+            %                       - For RAT-1, a vector of two elements representing
+            %                         start RB and number of RBs. Start RB is
+            %                         0-indexed.
+            %   W - Selected precoding matrix. It is a array of size
+            %       NumLayers-by-P where P is the number of antenna ports. The number
+            %       of rows in this matrix implicates the number of transmission layers
+            %       to be used for PDSCH.
+            %   MCSIndex - Selected modulation and coding scheme. This is
+            %              a row index (0-based) in the table specified in
+            %              nrGNB.MCSTable.
+
+            % Read time-frequency resources
+            scheduledSlot = timeFrequencyResource.NSlot;
+            startSym = timeFrequencyResource.SymbolAllocation(1);
+            numSym = timeFrequencyResource.SymbolAllocation(2);
+            updatedFrequencyStatus = timeFrequencyResource.FrequencyResource;
+            % Read scheduling info structure
+            eligibleUEs = schedulingInfo.EligibleUEs;
+            numNewTxs = min(size(eligibleUEs,2), schedulingInfo.MaxNumUsersTTI);
+            % Select index of the first UE for scheduling. After the last selected UE,
+            % go in sequence and find index of the first eligible UE
+            scheduledUEIndex = find(eligibleUEs>obj.LastSelectedUEDL, 1);
+            if isempty(scheduledUEIndex)
+                scheduledUEIndex = 1;
+            end
+
+            % Stores DL grants of the TTI
+            dlAssignments = obj.DLGrantArrayStruct(1:numNewTxs);
+
+            cellConfig = obj.CellConfig;
+            schedulerConfig = obj.SchedulerConfig;
+            ueContext = obj.UEContext;
+
+            % Select rank and precoding matrix for the eligible UEs
+            numEligibleUEs = size(eligibleUEs,2);
+            uePriority = ones(1,numEligibleUEs); % Higher the number higher is the priority
+            W = cell(numEligibleUEs, 1); % To store selected precoding matrices for the UEs
+            H = cell(numEligibleUEs, 1); % To store the channel matrices of the eligible UEs
+            SINR = cell(numEligibleUEs, 1); % To store the SINR values of the eligible UEs
+            rank = zeros(numEligibleUEs, 1); % To store selected rank for the UEs
+            rbRequirement = zeros(obj.NumUEs, 1); % To store RB requirement for UEs
+            channelQuality = zeros(obj.NumUEs, cellConfig.NumResourceBlocks); % To store channel quality information for UEs
+            cqiSizeArray = ones(cellConfig.NumResourceBlocks, 1);
+            nVar = 0;
+            for i=1:numEligibleUEs
+                rnti = eligibleUEs(i);
+                eligibleUEContext = ueContext(rnti);
+                carrierContext = eligibleUEContext.ComponentCarrier(1);
+                csiMeasurement = carrierContext.CSIMeasurementDL;
+                % csiMeasurementCQI = csiMeasurement.CSIRS.CQI*cqiSizeArray;
+                csiMeasurementCQI = max(csiMeasurement.CSIRS.CQI(:)) * cqiSizeArray(1);
+                channelQuality(rnti, :) = csiMeasurementCQI;
+                if isempty(carrierContext.CSIRSConfiguration)
+                    numCSIRSPorts = obj.CellConfig(1).NumTransmitAntennas;
+                else
+                    numCSIRSPorts = carrierContext.CSIRSConfiguration.NumCSIRSPorts;
+                end
+                [rank(i), W{i}] = selectRankAndPrecodingMatrixDL(obj, rnti, csiMeasurement, numCSIRSPorts);
+                % For SRS-based DL MU-MIMO CSI measurements, get the channel estimates
+                if ~isempty(schedulerConfig.MUMIMOConfigDL) && ~isempty(csiMeasurement.SRS)
+                    H{i} = csiMeasurement.SRS.H;
+                    nVar = csiMeasurement.SRS.nVar;
+                    SINR{i} = csiMeasurement.SRS.sinr;
+                end
+                [bitsPerRB, rbRequirement(rnti)] = calculateRBRequirement(obj, rnti, obj.DLType, numSym, rank(i));
+                if schedulerConfig.SchedulerStrategy ~= 0
+                    instantaneousThroughput = bitsPerRB * 1000/(numSym*cellConfig.SlotDuration/14); % Calculate instantaneous throughput
+                    averageDataRate = eligibleUEContext.UEsServedDataRate(obj.DLType+1);
+                    % Update priority of all the UEs
+                    uePriority(i) = instantaneousThroughput^schedulerConfig.AlphaPFS/averageDataRate^schedulerConfig.BetaPFS;
+                end
+            end
+
+            % Sort the UEs based on the calculated priority
+            if schedulerConfig.SchedulerStrategy ~= 0
+                [~,ueIndices] = sort(uePriority,'descend');
+                ueIndices = ueIndices(1:numNewTxs);
+            end
+
+            if schedulerConfig.SchedulerStrategy == 0 % Round-robin Scheduler
+                % Shift eligibleUEs set such that first eligible UE (as per
+                % round-robin assignment) is at first index
+                eligibilityOrder = circshift(eligibleUEs,  [0 -(scheduledUEIndex-1)]);
+                % UE Priority not considered for round-robin scheduler
+                updatedEligibleUEs = eligibilityOrder(1:numNewTxs);
+            elseif schedulerConfig.SchedulerStrategy == 2 % BestCQI Scheduler
+                % In case UEs have same priority but are not part of the selected UE
+                % indices, then randomize the selection. This will maintain BestCQI
+                % strategy and gives an opportunity to other UEs with the same priority.
+                updatedEligibleUEs = obj.randomizeUEsSelection(eligibleUEs, uePriority, ueIndices);
+            else % PF Scheduler
+                % Reorder UEs based on the priority
+                updatedEligibleUEs = eligibleUEs(ueIndices);
+            end
+
+            % Rearrange indices for channel measurement, buffer status and RB requirement
+            [~,~,matchingIndices] = intersect(updatedEligibleUEs,eligibleUEs,'stable');
+            rank = rank(matchingIndices);
+
+            % Create the input structure for scheduling strategy
+            schedulerInput = obj.SchedulerInputStruct;
+            schedulerInput.linkDir = obj.DLType;
+            if schedulerConfig.ResourceAllocationType % RAT-1
+                % For MU-MIMO configuration
+                schedulerInput.mcsRBG = zeros(1, numel(updatedEligibleUEs));
+                schedulerInput.cqiRBG = channelQuality(updatedEligibleUEs,:);
+                cqiSetRBG = floor(sum(schedulerInput.cqiRBG, 2)/size(schedulerInput.cqiRBG, 2));
+                for i = 1:numel(updatedEligibleUEs)
+                    schedulerInput.mcsRBG(i, 1) = selectMCSIndexDL(obj, cqiSetRBG(i), updatedEligibleUEs(i)); % MCS value
+                end
+            else % RAT-0
+                rbRequirement = rbRequirement(eligibleUEs(matchingIndices));
+                channelQuality = channelQuality(eligibleUEs(matchingIndices),:);
+            end
+            schedulerInput.eligibleUEs = updatedEligibleUEs;
+            schedulerInput.selectedRank = rank;
+            schedulerInput.bufferStatus = [ueContext(eligibleUEs(matchingIndices)).BufferStatusDL];
+            schedulerInput.lastSelectedUE = obj.LastSelectedUEDL;
+            schedulerInput.channelQuality = channelQuality;
+            schedulerInput.freqOccupancyBitmap = updatedFrequencyStatus;
+            schedulerInput.rbAllocationLimit = obj.RBAllocationLimitDL;
+            schedulerInput.rbRequirement = rbRequirement;
+            schedulerInput.maxNumUsersTTI = schedulingInfo.MaxNumUsersTTI;
+            schedulerInput.numSym = numSym;
+            schedulerInput.W = W(matchingIndices);
+            % For SRS-based MU-MIMO, get the channel estimates,
+            % noise variance, and SINRs and include them in the scheduler
+            % input.
+            if ~isempty(schedulerConfig.MUMIMOConfigDL) && obj.SchedulerConfig.CSIMeasurementSignalDLType
+                schedulerInput.channelMatrix = H(matchingIndices);
+                schedulerInput.nVar = nVar;
+                schedulerInput.SINRs = SINR(matchingIndices);
+            end
+            % Implement scheduling strategy. Also ensure that the number of RBs
+            % allotted to a UE in the slot does not exceed the limit as defined by the
+            % class property 'RBAllocationLimit'
+            % Run the scheduling strategy to select UEs, frequency resources and mcs indices
+            if schedulerConfig.ResourceAllocationType % RAT-1
+                [allottedUEs, freqAllocation, mcsIndex, W] = runSchedulingStrategyRAT1(obj, schedulerInput);
+            else % RAT-0
+                [allottedUEs, freqAllocation, mcsIndex, W] = runSchedulingStrategyRAT0(obj, schedulerInput);
+            end
+
+            numAllottedUEs = numel(allottedUEs);
+            for index = 1:numAllottedUEs
+                gNBCarrierIndex = 1;
+                dlAssignments(index).GNBCarrierIndex = gNBCarrierIndex;
+                selectedUE = allottedUEs(index);
+                % Allot RBs to the selected UE in this TTI
+                selectedUEIdx = find(updatedEligibleUEs == selectedUE, 1); % Find UE index in eligible UEs set
+                % MCS offset value
+                carrierContext = ueContext(selectedUE).ComponentCarrier(gNBCarrierIndex);
+                mcsOffset = fix(carrierContext.MCSOffset(schedulerInput.linkDir+1));
+                % Fill the new transmission RAT-1 downlink assignment properties
+                dlAssignments(index).RNTI = selectedUE;
+
+                dlAssignments(index).FrequencyAllocation = freqAllocation(index, :);
+                dlAssignments(index).MCSIndex = min(max(mcsIndex(index) - mcsOffset, 0), 27);
+                dlAssignments(index).W = W{selectedUEIdx};
+                % Mark frequency resources as assigned to the selected UE in this TTI
+                if schedulerConfig.ResourceAllocationType % RAT-1
+                    updatedFrequencyStatus(freqAllocation(index, 1)+1 : freqAllocation(index, 1)+freqAllocation(index, 2)) = 1;
+                else % RAT-0
+                    updatedFrequencyStatus = updatedFrequencyStatus | freqAllocation(index,:);
+                end
+            end
+
+            dlAssignments = dlAssignments(1:numAllottedUEs); % Remove invalid trailing entries
+        end
+
+        function ulGrants = scheduleNewTransmissionsUL(obj, timeFrequencyResource, schedulingInfo)
+            %scheduleNewTransmissionsUL Assign resources for new UL transmissions
+            %   ULGRANTS = scheduleNewTransmissionsUL(OBJ, TIMEFREQUENCYRESOURCE,
+            %   SCHEDULINGINFO) assigns the time and frequency resources defined by
+            %   TIMEFREQUENCYRESOURCE to different UEs for new transmissions. The
+            %   scheduler invokes this function after satisfying the retransmission
+            %   requirements for UEs, if any. As a result, not all frequency resources
+            %   of the bandwidth would be available for new transmission scheduling in
+            %   this TTI.
+            %
+            %   TIMEFREQUENCYRESOURCE represents the TTI i.e., the time symbols and the
+            %   frequency resources which this method is scheduling. It is a vector of
+            %   structures with structure elements representing time-frequency
+            %   resources of different carriers which scheduler is jointly scheduling.
+            %   Each structure element contains following fields:
+            %     GNBCarrierIndex - Index of the scheduled carrier in the CellConfig property. The
+            %                       CellConfig property lists all the carriers which gNB
+            %                       operates upon.
+            %     NFrame - Absolute frame number of the symbols getting scheduled
+            %     NSlot - The slot number in the frame 'NFrame' whose symbols are getting scheduled
+            %     SymbolAllocation - TTI symbol range as a vector of two integers: [StartSym NumSym]
+            %                     StartSym - Start symbol number (in the slot 'NSlot' of the frame 'NFrame') of the TTI getting scheduled
+            %                     NumSym - Number of symbols getting scheduled
+            %                     All the UL grants generated as output for this
+            %                     carrier span over this symbol range.
+            %     FrequencyResource - It represents the frequency resources getting scheduled.
+            %                         It is a bit vector as per following description.
+            %                         If resource allocation type (See
+            %                         'ResourceAllocationType' N-V parameter of
+            %                         nrGNB.configureScheduler) is 1 (i.e., RAT-1) then
+            %                         it is a bit vector of length equal to number of
+            %                         RBs in the UL bandwidth. If resource allocation
+            %                         type is 0 (i.e., RAT-0) then it is a bit vector of
+            %                         length equal to number of RBGs in the UL
+            %                         bandwidth. Value 0 at an index in the bit vector
+            %                         means that the corresponding RB/RBG is available
+            %                         for scheduling, otherwise, it is considered
+            %                         unavailable for scheduling. If all the frequency
+            %                         resources in a TTI are consumed by
+            %                         retransmissions, then scheduler does not invoke
+            %                         this function for that TTI.
+            %
+            %   Value of NFrame, NSlot and StartSym (in SymbolAllocation) is 0-based.
+            %
+            %   SCHEDULINGINFO contains information to be used for scheduling. It is a
+            %   vector of structures of same length as TIMEFREQUENCYRESOURCE. A structure element
+            %   contains information for a specific carrier which is present at the corresponding
+            %   index in TIMEFREQUENCYRESOURCE. Each structure element has following fields:
+            %   EligibleUEs - The set of eligible UEs for allocation in this TTI on this carrier. It is
+            %                 a vector of RNTI of the UEs. This set includes all the
+            %                 UEs connected to the gNB excluding the ones which match
+            %                 either of these criteria:
+            %                 (1) The UE is scheduled for retransmission in this TTI.
+            %                 (2) The UE does not have any queued data.
+            %                 (3) All the HARQ processes are blocked for the UE.
+            %                 If due to these criteria, none of the UEs qualify
+            %                 as eligible for the carrier then scheduler excludes that
+            %                 carrier for scheduling from TIMERESOURCE.
+            %   MaxNumUsersTTI - Maximum number of UEs which can be scheduled in the
+            %                    TTI for new transmissions. The value is adjusted for
+            %                    the retransmissions scheduled in this TTI i.e., the
+            %                    value is count of UEs scheduled for retransmissions in
+            %                    this TTI subtracted from total maximum allowed users
+            %                    in a TTI (See MaxNumUsersPerTTI N-V parameter of
+            %                    nrGNB.configureScheduler). If this value comes out to
+            %                    be zero then scheduler excludes this carrier for
+            %                    scheduling from TIMERESOURCE.
+            %
+            %   Note that in addition to information in SCHEDULINGINFO, any other
+            %   context in scheduler object, OBJ, can be used as information to decide
+            %   resource allocation to UEs.
+            %
+            %   ULGRANTS is a struct vector where each element represents one UL grant and
+            %   has following information as fields:
+            %   RNTI - Uplink grant is for this UE
+            %   GNBCarrierIndex - The carrier corresponding to this uplink grant.
+            %                  It is index of the carrier in CellConfig property. The
+            %                  CellConfig property lists all the carriers which gNB
+            %                  operates upon.
+            %   FrequencyAllocation - For RAT-0, a bit vector of length equal to number
+            %                         of RBGs in the UL bandwidth. Value 1
+            %                         at an index means that corresponding
+            %                         RBG is assigned for the grant
+            %                       - For RAT-1, a vector of two elements representing
+            %                         start RB and number of RBs. Start RB is
+            %                         0-based.
+            %   MCSIndex - Selected modulation and coding scheme
+            %   NumLayers - Number of transmission layers
+            %   TPMI - Selected precoding matrix corresponding to NumLayers. The
+            %          scheduler assumes that the number of antenna ports are equal to
+            %          number of Tx antennas on the UE.
+
+            % Read time-frequency resources
+            scheduledSlot = timeFrequencyResource.NSlot;
+            startSym = timeFrequencyResource.SymbolAllocation(1);
+            numSym = timeFrequencyResource.SymbolAllocation(2);
+            updatedFrequencyStatus = timeFrequencyResource.FrequencyResource;
+
+            % Read scheduling info structure
+            eligibleUEs = schedulingInfo.EligibleUEs;
+            numNewTxs = min(size(eligibleUEs,2), schedulingInfo.MaxNumUsersTTI);
+            % Select index of the first UE for scheduling. After the last selected UE,
+            % go in sequence and find index of the first eligible UE
+            scheduledUEIndex = find(eligibleUEs>obj.LastSelectedUEUL, 1);
+            if isempty(scheduledUEIndex)
+                scheduledUEIndex = 1;
+            end
+
+            % Stores UL grants of this TTI
+            ulGrants = obj.ULGrantArrayStruct(1:numNewTxs);
+
+            cellConfig = obj.CellConfig;
+            schedulerConfig = obj.SchedulerConfig;
+            ueContext = obj.UEContext;
+
+            % Select rank and precoding matrix for the eligible UEs
+            numEligibleUEs = size(eligibleUEs,2);
+            uePriority = ones(1,numEligibleUEs); % Higher the number higher is the priority
+            tpmi = zeros(numEligibleUEs, cellConfig.NumResourceBlocks); % To store selected precoding matrices for the UEs
+            rank = zeros(numEligibleUEs, 1); % To store selected rank for the UEs
+            rbRequirement =  zeros(obj.NumUEs, 1); % To store RB requirement for UEs
+            mcsArray = zeros(1, obj.NumUEs); % To store mcs information for UEs
+            for i=1:numEligibleUEs
+                rnti = eligibleUEs(i);
+                eligibleUEContext = ueContext(rnti);
+                carrierContext = eligibleUEContext.ComponentCarrier(1);
+                csiMeasurement = carrierContext.CSIMeasurementUL;
+                if isempty(obj.SchedulerConfig.FixedMCSIndexUL)
+                    mcsArray(rnti) = csiMeasurement.MCSIndex;
+                else
+                    % MCSIndex if FixedMCSIndexUL is configured
+                    mcsArray(rnti) = obj.SchedulerConfig.FixedMCSIndexUL;
+                end
+                if isempty(carrierContext.SRSConfiguration)
+                    numSRSPorts = carrierContext.NumTransmitAntennas;
+                else
+                    numSRSPorts = carrierContext.SRSConfiguration.NumSRSPorts;
+                end
+                [rank(i), tpmi(i, :), ~] = selectRankAndPrecodingMatrixUL(obj, csiMeasurement, numSRSPorts);
+                [bitsPerRB, rbRequirement(rnti)] = calculateRBRequirement(obj, rnti, obj.ULType, numSym, rank(i));
+                if schedulerConfig.SchedulerStrategy ~= 0
+                    instantaneousThroughput = bitsPerRB * 1000/(numSym*cellConfig.SlotDuration/14);
+                    averageDataRate = eligibleUEContext.UEsServedDataRate(obj.ULType+1);
+                    % Update priority of all the UEs
+                    uePriority(i) = instantaneousThroughput^schedulerConfig.AlphaPFS/averageDataRate^schedulerConfig.BetaPFS;
+                end
+            end
+
+            % Sort the UEs based on the calculated priority
+            if schedulerConfig.SchedulerStrategy ~= 0
+                [~,ueIndices] = sort(uePriority,'descend');
+                ueIndices = ueIndices(1:numNewTxs);
+            end
+
+            if schedulerConfig.SchedulerStrategy == 0 % Round-robin Scheduler
+                % Shift eligibleUEs set such that first eligible UE (as per
+                % round-robin assignment) is at first index
+                eligibilityOrder = circshift(eligibleUEs,  [0 -(scheduledUEIndex-1)]);
+                % UE Priority not considered for round-robin scheduler
+                updatedEligibleUEs = eligibilityOrder(1:numNewTxs);
+            elseif schedulerConfig.SchedulerStrategy == 2 % BestCQI Scheduler
+                % In case UEs have same priority but are not part of the selected UE
+                % indices, then randomize the selection. This will maintain BestCQI
+                % strategy and gives an opportunity to other UEs with the same priority.
+                updatedEligibleUEs = obj.randomizeUEsSelection(eligibleUEs, uePriority, ueIndices);
+            else % PF Scheduler
+                % Reorder UEs based on the priority
+                updatedEligibleUEs = eligibleUEs(ueIndices);
+            end
+
+            % Rearrange indices for channel measurement, buffer status and RB requirement
+            [~,~,matchingIndices] = intersect(updatedEligibleUEs,eligibleUEs,'stable');
+            rank = rank(matchingIndices);
+            tpmi = tpmi(matchingIndices,:);
+
+            if ~schedulerConfig.ResourceAllocationType % RAT-0
+                rbRequirement = rbRequirement(eligibleUEs(matchingIndices));
+                mcsArray = mcsArray(eligibleUEs(matchingIndices));
+            end
+            % Create the input structure for scheduling strategy
+            schedulerInput = obj.SchedulerInputStruct;
+            schedulerInput.linkDir = obj.ULType;
+            schedulerInput.eligibleUEs = updatedEligibleUEs;
+            schedulerInput.selectedRank = rank;
+            schedulerInput.bufferStatus = [ueContext(eligibleUEs(matchingIndices)).BufferStatusUL];
+            schedulerInput.lastSelectedUE = obj.LastSelectedUEUL;
+            schedulerInput.mcsIndexArray = mcsArray;
+            schedulerInput.freqOccupancyBitmap = updatedFrequencyStatus;
+            schedulerInput.rbAllocationLimit = obj.RBAllocationLimitUL;
+            schedulerInput.rbRequirement = rbRequirement;
+            schedulerInput.maxNumUsersTTI = schedulingInfo.MaxNumUsersTTI;
+
+            % Implement scheduling strategy. Also ensure that the number of RBs
+            % allotted to a UE in the slot does not exceed the limit as defined by the
+            % class property 'RBAllocationLimit'
+            % Run the scheduling strategy to select UEs, frequency resources and mcs indices
+            if schedulerConfig.ResourceAllocationType % RAT-1
+                [allottedUEs, freqAllocation, mcsIndex] = runSchedulingStrategyRAT1(obj, schedulerInput);
+            else % RAT-0
+                [allottedUEs, freqAllocation, mcsIndex] = runSchedulingStrategyRAT0(obj, schedulerInput);
+            end
+
+            numAllottedUEs = numel(allottedUEs);
+            for index = 1:numAllottedUEs
+                gNBCarrierIndex = 1;
+                ulGrants(index).GNBCarrierIndex = gNBCarrierIndex;
+                selectedUE = allottedUEs(index);
+                ueInfo = ueContext(selectedUE);
+                selectedUEIdx = find(updatedEligibleUEs == selectedUE, 1); % Find UE index in eligible UEs set
+                % MCS offset value
+                mcsOffset = fix(ueInfo.ComponentCarrier(gNBCarrierIndex).MCSOffset(schedulerInput.linkDir+1));
+                % Fill the new transmission uplink grant properties
+                ulGrants(index).RNTI = selectedUE;
+                ulGrants(index).FrequencyAllocation = freqAllocation(index, :);
+                ulGrants(index).MCSIndex = min(max(mcsIndex(index) - mcsOffset, 0), 27);
+                ulGrants(index).NumLayers = rank(selectedUEIdx);
+
+                % Mark frequency resources as assigned to the selected UE in this TTI
+                if schedulerConfig.ResourceAllocationType % RAT-1
+                    updatedFrequencyStatus(freqAllocation(index, 1)+1 : freqAllocation(index, 1)+freqAllocation(index, 2)) = 1;
+                else % RAT-0
+                    updatedFrequencyStatus = updatedFrequencyStatus | freqAllocation(index,:);
+                end
+            end
+
+            ulGrants = ulGrants(1:numAllottedUEs); % Remove invalid trailing entries
+            % Calculate a single TPMI value for the PUSCH assignment to UEs from the
+            % TPMI values of all the RBs allotted. Also select a free HARQ process to
+            % be used for uplink over the selected RBs. It was already ensured that UEs
+            % in allottedUEs set have at least one free HARQ process before deeming
+            % them eligible for getting resources for new transmission
+            for i = 1:numel(allottedUEs)
+                grant = ulGrants(i);
+                if schedulerConfig.ResourceAllocationType % RAT-1
+                    grantRBs = grant.FrequencyAllocation(1):grant.FrequencyAllocation(1) + ...
+                        grant.FrequencyAllocation(2) - 1;
+                else % RAT-0
+                    grantRBs = convertRBGBitmapToRBs(obj, grant.RNTI, grant.GNBCarrierIndex, grant.FrequencyAllocation);
+                end
+                tpmiRBs = tpmi(i, grantRBs+1);
+                ulGrants(i).TPMI = floor(sum(tpmiRBs)/numel(tpmiRBs)); % Taking average of the measured TPMI on grant RBs
+            end
+        end
+    end
+
+    methods (Hidden)
+        function obj = configureScheduler(obj, param)
+            %ConfigureScheduler Configures the MAC scheduler
+            %
+            % param is a structure including the following fields:
+            % DuplexMode             - Duplexing mode as 'FDD' or 'TDD'
+            % ResourceAllocationType - RAT-0 (value 0) or RAT-1 (value 1)
+            % NumResourceBlocks      - Number of resource blocks in PUSCH and PDSCH
+            %                          bandwidth
+            % SubcarrierSpacing      - Subcarrier spacing
+            % NumHARQ                - Number of HARQ processes
+            % RVSequence             - Redundancy version sequence to be followed
+            % DLULConfigTDD          - TDD specific configuration. It is a structure
+            %                          with following fields.
+            %       DLULPeriodicity - Duration of the DL-UL pattern in ms (for TDD
+            %                         mode)
+            %       NumDLSlots      - Number of full DL slots at the start of DL-UL
+            %                         pattern (for TDD mode)
+            %       NumDLSymbols    - Number of DL symbols after full DL slots of DL-UL
+            %                         pattern (for TDD mode)
+            %       NumULSymbols    - Number of UL symbols before full UL slots of
+            %                         DL-UL pattern (for TDD mode)
+            %       NumULSlots      - Number of full UL slots at the end of DL-UL
+            %                         pattern (for TDD mode)
+            % NumTransmitAntennas    - Number of GNB Tx antennas
+            % NumReceiverAntennas    - Number of GNB Rx antennas
+            % SRSReservedResource - SRS reserved resource as [symbolNum slotPeriodicity
+            %                       slotOffset]
+            % MaxNumUsersPerTTI   - Maximum users that can be scheduled per TTI
+            % FixedMCSIndexDL     - MCS index that will be used to allocate DL
+            %                       resources without considering any channel quality
+            %                       information
+            % FixedMCSIndexUL     - MCS index that will be used to allocate UL
+            %                       resources without considering any channel quality
+            %                       information
+            % CSIMeasurementSignalDL — DL channel state information measurement signal,
+            %                       specified as "SRS" or "CSI-RS".
+            % MUMIMOConfigDL   - MU-MIMO configuration structure contains these fields.
+            %   MaxNumUsersPaired - Maximum number of users that can be paired for a
+            %                       MU-MIMO transmission.
+            %   MinNumRBs         - Minimum number of RBs that should be allocated to a
+            %                       UE to be considered for MU-MIMO.
+            %   MinCQI            - Minimum CQI for a UE to be considered as a MU-MIMO
+            %                       candidate. This field is relevant only
+            %                       for CSI-RS-based MU-MIMO.
+            %   SemiOrthogonalityFactor
+            %                     - Inter-user interference (IUI) orthogonality
+            %                       factor based on which users can be paired for a
+            %                       MU-MIMO transmission. This field is relevant only
+            %                       for CSI-RS-based MU-MIMO.
+            %   MaxNumLayers      - Maximum number of layers that can be supported by
+            %                       the MU-MIMO DL transmission.
+            %   MinSINR           - Minimum SINR in dB for a UE to be considered as an
+            %                       MU-MIMO candidate. This field is relevant only
+            %                       for SRS-based MU-MIMO.
+            % Scheduler           - Scheduler strategy. For built in
+            %                       scheduler it is specified as either "RoundRobin",
+            %                       "ProportionalFair", or  "BestCQI". For custom
+            %                       strategy, it is an object of subclass of
+            %                       nrScheduler.
+            % PFSWindowSize       - Time constant of an exponential moving average,
+            %                       in number of slots. A Proportional Fair (PF)
+            %                       scheduler uses this time constant to calculate
+            %                       the average data rate.
+            % LinkAdaptationConfigDL
+            %                  - Link adaptation (LA) configuration structure for
+            %                    downlink transmissions. The structure contains the
+            %                    following fields,
+            %   InitialOffset     - Initial MCS offset applied to all UEs.
+            %   StepUp            - Indicates the value by which the MCS
+            %                       offset is increased when packet reception fails.
+            %   StepDown          - Indicates the value by which the MCS
+            %                       offset is decreased  when packet reception is
+            %                       successful.
+            % LinkAdaptationConfigUL
+            %                  - Link adaptation (LA) configuration structure for
+            %                    uplink transmissions. The structure has same fields as
+            %                    'LinkAdaptationConfigDL
+
+            % Initialize cell configuration object
+            cellConfigStruct = struct(SubcarrierSpacing=param.SubcarrierSpacing, NumResourceBlocks=param.NumResourceBlocks, ...
+                DuplexMode=param.DuplexMode, DMRSTypeAPosition=param.DMRSTypeAPosition, ULReservedResource=param.SRSReservedResource, ...
+                NumTransmitAntennas=param.NumTransmitAntennas, NumReceiveAntennas=param.NumReceiveAntennas);
+            if param.DuplexMode == "TDD"
+                cellConfigStruct.DLULConfigTDD = param.DLULConfigTDD;
+            end
+            cellConfig = nr5g.internal.nrCellConfig(cellConfigStruct);
+            obj.CellConfig = cellConfig;
+            scs = cellConfig.SubcarrierSpacing;
+
+            % Initialize scheduler configuration object
+            strategyIndependentConfig = {'ResourceAllocationType', 'MaxNumUsersPerTTI', 'RVSequence', 'CSIMeasurementSignalDLType'};
+            strategySpecificConfig = {'Scheduler', 'PFSWindowSize', 'FixedMCSIndexDL', 'FixedMCSIndexUL', 'MUMIMOConfigDL', ...
+                'LinkAdaptationConfigDL', 'LinkAdaptationConfigUL'};
+            for idx=1:size(strategyIndependentConfig,2)
+                if strcmp('CSIMeasurementSignalDLType', strategyIndependentConfig(idx))
+                    schedulerConfigStruct.(char(strategyIndependentConfig(idx))) = strcmpi(param.CSIMeasurementSignalDL, "SRS");
+                else
+                    schedulerConfigStruct.(char(strategyIndependentConfig(idx))) = param.(char(strategyIndependentConfig(idx)));
+                end
+            end
+            if ~isa(param.Scheduler, 'nrScheduler') % User has supplied scheduler as RR, PF, or BestCQI
+                for idx=1:size(strategySpecificConfig,2)
+                    schedulerConfigStruct.(char(strategySpecificConfig(idx))) = param.(char(strategySpecificConfig(idx)));
+                end
+                obj.EnableSchedulingValidation = 0;
+            else % User has installed custom scheduler
+                obj.EnableSchedulingValidation = 1;
+            end
+            schedulerConfig = nr5g.internal.nrSchedulerConfig(schedulerConfigStruct);
+            obj.SchedulerConfig = schedulerConfig;
+
+            % Set RB allocation limit
+            numRBs = cellConfig.NumResourceBlocks;
+            obj.RBAllocationLimitUL = numRBs;
+            obj.RBAllocationLimitDL = numRBs;
+
+            % Set HARQ process count
+            obj.NumHARQ = param.NumHARQ;
+
+            if cellConfig.DuplexModeNumber % TDD
+                % Get the first slot with UL symbols
+                slotNum = 0;
+                while slotNum < cellConfig.NumDLULPatternSlots
+                    if find(cellConfig.DLULSlotFormat(slotNum + 1, :) == obj.ULType, 1)
+                        break; % Found a slot with UL symbols
+                    end
+                    slotNum = slotNum + 1;
+                end
+
+                obj.CellConfig.NextULSchedulingSlot = slotNum; % Set the first slot to be scheduled by UL scheduler
+            end
+
+            slotDuration = cellConfig.SlotDuration; % In ms
+
+            % Default value of PUSCH preparation time is 100 microseconds.
+            % Calculate PUSCH preparation time in terms of number of
+            % symbols
+            obj.PUSCHPreparationTime = ceil(100/((slotDuration*1000)/14));
+
+            % Store the CQI tables as matrices
+            obj.CQITableUL = nr5g.internal.MACConstants.CQITable;
+            obj.CQITableDL = nr5g.internal.MACConstants.CQITable;
+
+            % Set the MCS tables as matrices
+            obj.MCSTableUL = nr5g.internal.MACConstants.MCSTable;
+            obj.MCSTableDL = nr5g.internal.MACConstants.MCSTable;
+
+            % Create carrier configuration object for UL
+            obj.CarrierConfigUL = nrCarrierConfig;
+            obj.CarrierConfigUL.SubcarrierSpacing = scs;
+            % Create carrier configuration object for DL
+            obj.CarrierConfigDL = obj.CarrierConfigUL;
+
+            % Create PUSCH and PDSCH configuration objects and use them to
+            % optimize performance
+            obj.PUSCHConfig = nrPUSCHConfig;
+            obj.PUSCHConfig.DMRS = nrPUSCHDMRSConfig(DMRSConfigurationType=obj.PUSCHDMRSConfigurationType, ...
+                DMRSTypeAPosition=cellConfig.DMRSTypeAPosition, DMRSLength=obj.PUSCHDMRSLength);
+            % Accommodate for UL direction the CDM groups in use (not available for data)
+            obj.CDMGroupsInUseUL(1:obj.PUSCHConfig.DMRS.NumCDMGroupsWithoutData+1) = 1;
+            obj.CDMGroupsInUseUL(obj.PUSCHConfig.DMRS.CDMGroups+1) = 1;
+            obj.PDSCHConfig = nrPDSCHConfig;
+            obj.PDSCHConfig.DMRS = nrPDSCHDMRSConfig(DMRSConfigurationType=obj.PDSCHDMRSConfigurationType, ...
+                DMRSTypeAPosition=cellConfig.DMRSTypeAPosition, DMRSLength=obj.PDSCHDMRSLength);
+            % Accommodate for DL direction the CDM groups in use (not available for data)
+            obj.CDMGroupsInUseDL(1:obj.PDSCHConfig.DMRS.NumCDMGroupsWithoutData+1) = 1;
+            obj.CDMGroupsInUseDL(obj.PDSCHConfig.DMRS.CDMGroups+1) = 1;
+
+            % Initialize the grant arrays
+            obj.DLGrantArrayStruct = repmat(obj.DLGrantArrayStruct, schedulerConfig.MaxNumUsersPerTTI, 1);
+            obj.ULGrantArrayStruct = repmat(obj.ULGrantArrayStruct, schedulerConfig.MaxNumUsersPerTTI, 1);
+
+            % Get the number of inputs for new Tx scheduling functions. This is to
+            % ensure that correct signature is invoked as implemented in custom
+            % scheduler class
+            info = metaclass(obj);
+            methodNames = string({info.MethodList.Name});
+            numInput = numel(info.MethodList(find(methodNames == "scheduleNewTransmissionsDL")).InputNames);
+            obj.IsSingleCarrierFormatNewTxDL = (numInput == 4);
+            numInput = numel(info.MethodList(find(methodNames == "scheduleNewTransmissionsUL")).InputNames);
+            obj.IsSingleCarrierFormatNewTxUL = (numInput == 4);
+        end
+
+        function addCarrier(obj, carrierInfo)
+            %addCarrier Add a new carrier (or cell) to gNB
+            % This method sets up an additional carrier on gNB. Note that one carrier is
+            % already configured on scheduler using configureScheduler method.
+            %
+            % carrierInfo is a structure including the following fields:
+            %   NumResourceBlocks  - Number of resource blocks in channel bandwidth
+            %   DuplexMode         - Duplexing mode as FDD or TDD
+            %   DLULConfigTDD      - Downlink (DL) and uplink (UL) TDD configuration (Only for TDD mode
+            %   ULReservedResource - UL reserved resource as [symbolNum slotPeriodicity slotOffset]
+            %   NumTransmitAntennas - Number of transmit antennas used by gNB on this cell
+            %   NumReceiveAntennas  - Number of receive antennas used by gNB on this cell
+
+            % Set-up SCS and DM-RS type-A position same as first cell
+            carrierInfo.SubcarrierSpacing = obj.CellConfig(1).SubcarrierSpacing;
+            carrierInfo.DMRSTypeAPosition = obj.CellConfig(1).DMRSTypeAPosition;
+
+            % Append new carrier to the cell context
+            cellConfig = nr5g.internal.nrCellConfig(carrierInfo);
+            obj.CellConfig = [obj.CellConfig cellConfig];
+            if cellConfig.DuplexModeNumber % TDD
+                % Get the first slot with UL symbols
+                slotNum = 0;
+                while slotNum < cellConfig.NumDLULPatternSlots
+                    if find(cellConfig.DLULSlotFormat(slotNum + 1, :) == obj.ULType, 1)
+                        break; % Found a slot with UL symbols
+                    end
+                    slotNum = slotNum + 1;
+                end
+                cellConfig.NextULSchedulingSlot = slotNum; % Set the first slot to be scheduled by UL scheduler
+            end
+        end
+
+        function addConnectionContext(obj, connectionConfig)
+            %addConnectionContext Configures the scheduler with UE primary connection information
+
+            % Assume that UE connects with carrier at first index (in obj.CellConfig) as primary carrier
+            primaryCarrierIndex = 1;
+            cellConfig = obj.CellConfig(primaryCarrierIndex);
+            connectionConfig.PrimaryCarrierIndex = primaryCarrierIndex;
+            connectionConfig.NumCarriersGNB = numel(obj.CellConfig);
+
+            % Add additional connection configuration required to maintain in UE context
+            additionalConnectionConfig = ["NumHARQ", "PUSCHPreparationTime", "PUSCHDMRSConfigurationType", "PUSCHDMRSLength", ...
+                "PUSCHDMRSAdditionalPosTypeA", "PUSCHDMRSAdditionalPosTypeB", "PDSCHDMRSConfigurationType", "PDSCHDMRSLength", ...
+                "PDSCHDMRSAdditionalPosTypeA", "PDSCHDMRSAdditionalPosTypeB", "RBGSizeConfig"];
+            for idx=1:numel(additionalConnectionConfig)
+                connectionConfig.(additionalConnectionConfig(idx)) = obj.(additionalConnectionConfig(idx));
+            end
+
+            % Initialize and append UE context object
+            ueContext = nr5g.internal.nrUEContext(connectionConfig, cellConfig, obj.SchedulerConfig);
+            obj.UEContext = [obj.UEContext ueContext];
+            obj.NumUEs = obj.NumUEs + 1;
+
+            if obj.NumUEs > 1 % Add PDSCH/PUSCH config objects for the UE (For runtime optimization)
+                obj.PDSCHConfig = [obj.PDSCHConfig obj.PDSCHConfig(1)];
+                obj.PDSCHConfig(end).RNTI = ueContext.RNTI;
+                obj.PUSCHConfig = [obj.PUSCHConfig obj.PUSCHConfig(1)];
+                obj.PUSCHConfig(end).RNTI = ueContext.RNTI;
+            end
+        end
+
+        function addSecondaryCarrier(obj, rnti, gNBCarrierIndex, connectionConfig)
+            %addSecondaryCarrier Add the specified carrier as secondary carrier for the UE
+
+            ueContext = obj.UEContext(rnti);
+            ueContext.addSecondaryCarrier(gNBCarrierIndex, connectionConfig, obj.CellConfig(gNBCarrierIndex), obj.SchedulerConfig);
+        end
+
+
+        function updateSRSPeriod(obj, rnti, srsPeriod, gNBCarrierIndex)
+            %updateSRSPeriod Update the SRS periodicity of UE for the specified carrier
+
+            if nargin == 3
+                gNBCarrierIndex = 1;
+            end
+            obj.UEContext(rnti).updateSRSPeriod(srsPeriod, gNBCarrierIndex);
+        end
+
+        function addBearerConfig(obj, rnti, bearerConfig)
+            %addBearerConfig Add bearer configuration to scheduler
+
+            addBearerConfig(obj.UEContext(rnti), bearerConfig);
+        end
+
+        function resourceAssignments = runDLScheduler(obj, currentTimeInfo)
+            %runDLScheduler Run the DL scheduler
+            %
+            %   RESOURCEASSIGNMENTS = runDLScheduler(OBJ, CURRENTTIMEINFO)
+            %   runs the DL scheduler and returns the resource assignments
+            %   structure vector.
+            %
+            %   CURRENTTIMEINFO is the current time related information passed to
+            %   scheduler for scheduling. It is a structure with following fields:
+            %       NFrame - Current absolute frame number
+            %       NSlot - Current slot number
+            %       NSymbol - Current symbol number
+            %
+            %   RESOURCEASSIGNMENTS is a structure that contains the
+            %   DL resource assignments information.
+
+            ueContext = obj.UEContext;
+            % Return an empty array, if no UE is connected to the gNB
+            if isempty(ueContext)
+                resourceAssignments = struct([]);
+                return;
+            end
+
+            % Set current time information before doing the scheduling
+            obj.CurrSlot = currentTimeInfo.NSlot;
+            obj.CurrSymbol = currentTimeInfo.NSymbol;
+            obj.CurrFrame = currentTimeInfo.NFrame;
+
+            % Update the average downlink data rate for all UEs with zero instantaneous data rate
+            % Applicable only for PF Scheduler
+            schedulerConfig = obj.SchedulerConfig;
+            if schedulerConfig.SchedulerStrategy == 1 % PFS
+                for idx=1:obj.NumUEs
+                    ueContext(idx).updateUEsServedDataRate(obj.DLType, schedulerConfig, 0);
+                end
+            end
+
+            % For each carrier, select the slots to be scheduled now
+            numDLAssignments = 0;
+            slotsToBeScheduled = []; % Variable to hold slots to be scheduled for all carriers
+            for carrierIndex=1:numel(obj.CellConfig)
+                cellConfig = obj.CellConfig(carrierIndex);
+                if cellConfig.DuplexModeNumber % TDD
+                    % Calculate DL-UL slot index in the DL-UL pattern
+                    cellConfig.CurrDLULSlotIndex = mod(obj.CurrFrame*cellConfig.NumSlotsFrame + obj.CurrSlot, cellConfig.NumDLULPatternSlots);
+                end
+                selectedSlots = selectDLSlotsToBeScheduled(obj, carrierIndex);
+                for i=1:size(selectedSlots, 1) % For each selected slot
+                    frameNum = selectedSlots(i, 1);
+                    slotNum = selectedSlots(i, 2);
+                    % Carrier index at first column
+                    slotsToBeScheduled(end+1, 1) = carrierIndex;
+                    % Absolute slot number at second column
+                    slotsToBeScheduled(end, 2) = (cellConfig.NumSlotsFrame)*frameNum + slotNum;
+                end
+            end
+            if isempty(slotsToBeScheduled)
+                resourceAssignments = struct([]);
+                return;
+            end
+            slotsToBeScheduled = sortrows(slotsToBeScheduled, 2); % Sort selected slots (across the carriers)
+
+            % Schedule the selected slots (Same slot number is scheduled jointly across carriers)
+            i=1;
+            carrierIndexList = -1*ones(size(slotsToBeScheduled,1), 1);
+            while i<=size(slotsToBeScheduled, 1)
+                % When number of slots to be scheduled is greater than 1, historical UE served data is
+                % updated for all additional slots.
+                if (i > 1) && (schedulerConfig.SchedulerStrategy == 1)
+                    % Update the average downlink data rate for all UEs with zero instantaneous data rate
+                    for idx=1:obj.NumUEs
+                        ueContext(idx).updateUEsServedDataRate(obj.DLType, schedulerConfig, 0);
+                    end
+                end
+
+                carrierCount = 1; % Number for carriers selected for joint scheduling for the slot
+                carrierIndexList(carrierCount) = slotsToBeScheduled(i,1);
+                absoluteSlotNum = slotsToBeScheduled(i,2);
+                nFrame = floor(absoluteSlotNum/obj.CellConfig(carrierIndex).NumSlotsFrame);
+                nSlot = mod(absoluteSlotNum,obj.CellConfig(carrierIndex).NumSlotsFrame);
+                i = i+1;
+                % Find all the upcoming rows in 'slotsToBeScheduled' with same slot number
+                while i<=size(slotsToBeScheduled, 1) && absoluteSlotNum==slotsToBeScheduled(i,2)
+                    carrierCount = carrierCount+1;
+                    carrierIndexList(carrierCount) = slotsToBeScheduled(i,1);
+                    i = i+1;
+                end
+                % Schedule the slot for all carriers
+                slotDLAssignments = scheduleDLResourcesSlot(obj, nFrame, nSlot, carrierIndexList(1:carrierCount));
+
+                % Calculate TBS for each grant. The TBS is sent as part of the grant for
+                % runtime optimization. This saves the UE from re-calculating TBS using
+                % grant details
+                if ~isempty(slotDLAssignments)
+                    for j=1:numel(slotDLAssignments)
+                        assignment = slotDLAssignments(j);
+                        rnti = assignment.RNTI;
+                        if strcmp(assignment.Type,"newTx")
+                            tbs = tbsCapability(obj, assignment, obj.DLType);
+                            slotDLAssignments(j).TBS = floor(tbs/8); % Convert to bytes
+                            if obj.SchedulerConfig.SchedulerStrategy == 1 % PF
+                                % Update served data rate only for new transmission
+                                cellConfig = obj.CellConfig(assignment.GNBCarrierIndex);
+                                instantaneousDataRate = tbs*1000/(assignment.NumSymbols*cellConfig.SlotDuration/14);
+                                ueContext(rnti).updateUEsServedDataRate(obj.DLType, schedulerConfig, instantaneousDataRate);
+                            end
+                        else
+                            % Use TBS of the original transmission
+                            carrierContext = ueContext(rnti).ComponentCarrier(assignment.GNBCarrierIndex);
+                            slotDLAssignments(j).TBS = carrierContext.TBSizeDL(assignment.HARQID+1);
+                        end
+                    end
+                    resourceAssignments(numDLAssignments+1 : numDLAssignments+numel(slotDLAssignments)) = slotDLAssignments(:);
+                    numDLAssignments = numDLAssignments + numel(slotDLAssignments);
+                    updateHARQContextDL(obj, slotDLAssignments);
+                    updateBufferStatusForGrants(obj, 0, slotDLAssignments);
+                end
+            end
+            if ~numDLAssignments
+                resourceAssignments = struct([]);
+            end
+        end
+
+        function resourceAssignments = runULScheduler(obj, currentTimeInfo)
+            %runULScheduler Run the UL scheduler
+            %
+            %   RESOURCEASSIGNMENTS = runULScheduler(OBJ, CURRENTTIMEINFO)
+            %   runs the UL scheduler and returns the resource assignments
+            %   structure vector.
+            %
+            %   CURRENTTIMEINFO is the current time related information passed to
+            %   scheduler for scheduling. It is a structure with following fields:
+            %       NFrame - Current absolute frame number
+            %       NSlot - Current slot number
+            %       NSymbol - Current symbol number
+            %
+            %   RESOURCEASSIGNMENTS is a structure that contains the
+            %   UL resource assignments information.
+
+            ueContext = obj.UEContext;
+            % Return an empty array, if no UE is connected to the gNB
+            if isempty(ueContext)
+                resourceAssignments = struct([]);
+                return;
+            end
+
+            % Set current time information before doing the scheduling
+            obj.CurrSlot = currentTimeInfo.NSlot;
+            obj.CurrSymbol = currentTimeInfo.NSymbol;
+            obj.CurrFrame = currentTimeInfo.NFrame;
+            % Update the average uplink data rate for all UEs with zero instantaneous data rate
+            % Applicable only for PF Scheduler
+            schedulerConfig = obj.SchedulerConfig;
+            if schedulerConfig.SchedulerStrategy == 1 % PFS
+                for idx=1:obj.NumUEs
+                    ueContext(idx).updateUEsServedDataRate(obj.ULType, schedulerConfig, 0);
+                end
+            end
+
+            % Select the slots to be scheduled now
+            numULGrants = 0;
+            slotsToBeScheduled = []; % Variable to hold slots to be scheduled for all carriers
+            for carrierIndex=1:numel(obj.CellConfig)
+                cellConfig = obj.CellConfig(carrierIndex);
+                if cellConfig.DuplexModeNumber % TDD
+                    % Calculate DL-UL slot index in the DL-UL pattern
+                    cellConfig.CurrDLULSlotIndex = mod(obj.CurrFrame*cellConfig.NumSlotsFrame + obj.CurrSlot, cellConfig.NumDLULPatternSlots);
+                end
+                selectedSlots = selectULSlotsToBeScheduled(obj, carrierIndex); % Select the set of slots to be scheduled in this UL scheduler run
+                for i=1:size(selectedSlots, 1) % For each selected slot
+                    frameNum = selectedSlots(i, 1);
+                    slotNum = selectedSlots(i, 2);
+                    % Carrier index at first column
+                    slotsToBeScheduled(end+1, 1) = carrierIndex;
+                    % Absolute slot number at second column
+                    slotsToBeScheduled(end, 2) = (cellConfig.NumSlotsFrame)*frameNum + slotNum;
+                    % For last selected UL slot (if TDD carrier), set the next slot to be scheduled
+                    if i==size(selectedSlots, 1) && cellConfig.DuplexModeNumber
+                        % If any UL slots are scheduled, set the next to-be-scheduled UL slot as
+                        % the next UL slot after last scheduled UL slot
+                        lastSchedULSlot = selectedSlots(i, 2);
+                        cellConfig.NextULSchedulingSlot = getToBeSchedULSlotNextRun(obj, lastSchedULSlot, carrierIndex);
+                    end
+                end
+            end
+            if isempty(slotsToBeScheduled)
+                resourceAssignments = struct([]);
+                return;
+            end
+            slotsToBeScheduled = sortrows(slotsToBeScheduled, 2); % Sort selected slots (across the carriers) based on slot number
+
+            % Schedule the selected slots (Same slot number is scheduled jointly across carriers)
+            i=1;
+            carrierIndexList = -1*ones(size(slotsToBeScheduled,1), 1);
+            while i<=size(slotsToBeScheduled, 1)
+                % When number of slots to be scheduled is greater than 1, historical UE served data is
+                % updated for all additional slots.
+                if (i > 1) && (schedulerConfig.SchedulerStrategy == 1) % PFS
+                    % Update the average uplink data rate for all UEs with zero instantaneous data rate
+                    for idx=1:obj.NumUEs
+                        ueContext(idx).updateUEsServedDataRate(obj.ULType, schedulerConfig, 0);
+                    end
+                end
+                carrierCount = 1; % Number for carriers selected for joint scheduling for the slot
+                carrierIndexList(carrierCount) = slotsToBeScheduled(i,1);
+                absoluteSlotNum = slotsToBeScheduled(i,2);
+                nFrame = floor(absoluteSlotNum/obj.CellConfig(carrierIndex).NumSlotsFrame);
+                nSlot = mod(absoluteSlotNum,obj.CellConfig(carrierIndex).NumSlotsFrame);
+                i = i+1;
+                % Find all the upcoming rows in 'slotsToBeScheduled' with same slot number
+                while i<=size(slotsToBeScheduled, 1) && absoluteSlotNum==slotsToBeScheduled(i,2)
+                    carrierCount = carrierCount+1;
+                    carrierIndexList(carrierCount) = slotsToBeScheduled(i,1);
+                    i = i+1;
+                end
+                % Schedule the slot for all carriers
+                slotULGrants = scheduleULResourcesSlot(obj, nFrame, nSlot, carrierIndexList(1:carrierCount));
+                % Calculate TBS for each grant. The TBS is sent as part of the grant for
+                % runtime optimization. This saves the UE from re-calculating TBS using
+                % grant details
+                if ~isempty(slotULGrants)
+                    for j=1:numel(slotULGrants)
+                        grant = slotULGrants(j);
+                        rnti = grant.RNTI;
+                        if strcmp(grant.Type,"newTx")
+                            tbs = tbsCapability(obj, grant, obj.ULType);
+                            slotULGrants(j).TBS = floor(tbs/8); % Convert to bytes
+                            if obj.SchedulerConfig.SchedulerStrategy == 1 % PF
+                                % Update served data rate only for new transmission
+                                cellConfig = obj.CellConfig(grant.GNBCarrierIndex);
+                                instantaneousDataRate = tbs*1000/(grant.NumSymbols*cellConfig.SlotDuration/14);
+                                ueContext(rnti).updateUEsServedDataRate(obj.ULType, schedulerConfig, instantaneousDataRate);
+                            end
+                        else
+                            % Use TBS of the original transmission
+                            carrierContext = ueContext(rnti).ComponentCarrier(grant.GNBCarrierIndex);
+                            slotULGrants(j).TBS = carrierContext.TBSizeUL(grant.HARQID+1);
+                        end
+                    end
+                    resourceAssignments(numULGrants+1 : numULGrants+numel(slotULGrants)) = slotULGrants(:);
+                    numULGrants = numULGrants + numel(slotULGrants);
+                    updateHARQContextUL(obj, slotULGrants);
+                    updateBufferStatusForGrants(obj, 1, slotULGrants);
+                end
+            end
+            if ~numULGrants
+                resourceAssignments = struct([]);
+            end
+        end
+
+        function updateLCBufferStatusDL(obj, lchBufferStatus)
+            %updateLCBufferStatusDL Update DL buffer status for a logical channel of the specified UE
+            %
+            %   updateLCBufferStatusDL(obj, LCBUFFERSTATUS) updates the
+            %   DL buffer status for a logical channel of the specified UE.
+            %
+            %   LCBUFFERSTATUS is a structure with following three fields.
+            %       RNTI - RNTI of the UE
+            %       LogicalChannelID - Logical channel ID
+            %       BufferStatus - Pending amount in bytes for the specified logical channel of UE
+
+            % Update DL buffer status for a logical channel of UE having RNTI value as 'rnti'
+            obj.UEContext(lchBufferStatus.RNTI).updateLCBufferStatusDL(lchBufferStatus);
+        end
+
+        function processMACControlElement(obj, rnti, pktInfo, varargin)
+            %processMACControlElement Process the received MAC control element
+            %
+            %   processMACControlElement(OBJ, RNTI, PKTINFO) processes the received MAC
+            %   control element (CE) of the specified UE. This interface currently
+            %   supports buffer status report (BSR) only.
+            %
+            %   processMACControlElement(OBJ, RNTI, PKTINFO, LCGPRIORITY) processes the
+            %   received MAC control element (CE) of the specified UE. This interface
+            %   currently supports long truncated buffer status report (BSR) only.
+            %
+            %   RNTI - RNTI of the UE which sent the MAC CE
+            %   PKTINFO - A structure with packet information
+            %   LCGPRIORITY - A vector of priorities of all the LCGs of UE with rnti
+            %   value RNTI, used for processing long truncated BSR
+
+            % Pass the received MAC control element to UE having RNTI value as 'rnti'
+            obj.UEContext(rnti).processMACControlElement(pktInfo, varargin{1});
+        end
+
+        function updateChannelQualityUL(obj, channelQualityInfo)
+            %updateChannelQualityUL Update uplink channel quality information for a UE
+            %   UPDATECHANNELQUALITYUL(OBJ, CHANNELQUALITYINFO) updates
+            %   uplink (UL) channel quality information for a UE.
+            %   CHANNELQUALITYINFO is a structure with these fields: RNTI, GNBCarrierIndex, RI, TPMI, MCSIndex.
+
+            if ~isfield(channelQualityInfo, 'GNBCarrierIndex')
+                channelQualityInfo.GNBCarrierIndex = 1;
+            end
+            % Update uplink channel quality information for a UE having RNTI value as 'rnti'
+            obj.UEContext(channelQualityInfo.RNTI).updateChannelQualityUL(channelQualityInfo, obj.SchedulerConfig);
+        end
+
+        function updateChannelQualityDL(obj, channelQualityInfo)
+            %updateChannelQualityDL Update downlink channel quality information for a UE
+            %   UPDATECHANNELQUALITYDL(OBJ, CHANNELQUALITYINFO) updates
+            %   downlink (DL) channel quality information for a UE.
+            %   CHANNELQUALITYINFO is a structure with these fields: RNTI, GNBCarrierIndex, RI, PMISet, W, CQI.
+
+            if ~isfield(channelQualityInfo, 'GNBCarrierIndex')
+                channelQualityInfo.GNBCarrierIndex = 1;
+            end
+            % Update downlink channel quality information for a UE having RNTI value as 'rnti'
+            obj.UEContext(channelQualityInfo.RNTI).updateChannelQualityDL(channelQualityInfo, obj.SchedulerConfig);
+            % Update user pairing matrix if CSI-RS-based DL MU-MIMO is enabled
+            if ~isempty(obj.SchedulerConfig.MUMIMOConfigDL) && channelQualityInfo.GNBCarrierIndex == 1 && ~obj.SchedulerConfig.CSIMeasurementSignalDLType
+                obj.UserPairingMatrix = updateUserPairingMatrix(obj.UserPairingMatrix, obj.UEContext, obj.SchedulerConfig.MUMIMOConfigDL);
+            end
+        end
+
+        function handleDLRxResult(obj, rxResultInfo)
+            %handleDLRxResult Update the HARQ process context based on the Rx success/failure for DL packets
+            % handleDLRxResult(OBJ, RXRESULTINFO) updates the HARQ
+            % process context, based on the ACK/NACK received by gNB for
+            % the DL packet.
+            %
+            % RXRESULTINFO is a structure with following fields.
+            %   RNTI - UE that sent the ACK/NACK for its DL reception.
+            %   GNBCarrierIndex - Carrier index
+            %   HARQID - HARQ process ID
+            %   RxResult - 0 means NACK or no feedback received. 1 means ACK.
+
+            if ~isfield(rxResultInfo, 'GNBCarrierIndex')
+                rxResultInfo.GNBCarrierIndex = 1;
+            end
+            % Update UE context with respect to packet reception success/failure
+            obj.UEContext(rxResultInfo.RNTI).handleDLRxResult(rxResultInfo, obj.SchedulerConfig);
+        end
+
+        function handleULRxResult(obj, rxResultInfo)
+            %handleULRxResult Update the HARQ process context based on the Rx success/failure for UL packets
+            % handleULRxResult(OBJ, RXRESULTINFO) updates the HARQ
+            % process context, based on the reception success/failure of
+            % UL packets.
+            %
+            % RXRESULTINFO is a structure with following fields.
+            %   RNTI - UE corresponding to the UL packet.
+            %   GNBCarrierIndex - Carrier index
+            %   HARQID - HARQ process ID.
+            %   RxResult - 0 means Rx failure or no reception. 1 means Rx success.
+
+            if ~isfield(rxResultInfo, 'GNBCarrierIndex')
+                rxResultInfo.GNBCarrierIndex = 1;
+            end
+            % Update UE context with respect to packet reception success/failure
+            obj.UEContext(rxResultInfo.RNTI).handleULRxResult(rxResultInfo, obj.SchedulerConfig);
+        end
+
+        function [allottedUEs, freqAllocation, mcsIndex, W] = runSchedulingStrategyRAT0(obj, schedulerInput)
+            %runSchedulingStrategyRAT0 Implements the round-robin, proportional fair
+            %and best CQI scheduling
+            %
+            %   [ALLOTTEDUEs, FREQALLOCATION, MCSINDEX, W] =
+            %   runSchedulingStrategyRAT0(OBJ, SCHEDULERINPUT) returns the allotted UEs
+            %   with their frequency allocation for this slot, along with the suitable
+            %   mcsIndex and precoding matrices based on the channel condition. The precoding
+            % 	matrices are assigned only for MU-MIMO in DL. This function gets called for
+            %	selecting UEs for new transmission, i.e., once for each slot after
+            %   assignment for retransmissions is completed.
+            %
+            %   SCHEDULERINPUT structure contains the following fields which scheduler
+            %   would use (not necessarily all the information) for selecting the UE to
+            %   which RBG would be assigned.
+            %
+            %       eligibleUEs        -  RNTI of the eligible UEs contending for the avaliable RBGs
+            %       rbRequirement      -  RB requirement of UEs as per their buffered amount and CQI-based MCS
+            %       bufferStatus       -  Buffer-Status of UEs. Vector of N elements where 'N'
+            %                             is the number of eligible UEs, containing pending
+            %                             buffer status for UEs
+            %       lastSelectedUE      - The RNTI of the UE which was assigned the last scheduled RBG
+            %       linkDir             - Link direction as DL (value 0) or UL (value 1)
+            %       freqOccupancyBitmap - Holds RBG occupancy status after RBGs got allotted for retransmission
+            %       rbAllocationLimit   - Maximum number of RBs allotted to a UE in a particular slot
+            %       channelQuality      - Channel quality information of the eligible UEs.
+            %                             Vector of N elements where 'N' is the number of eligible UEs
+            %       maxNumUsersTTI      - Number of UEs that can be scheduled in this TTI for new Tx
+
+            initialEligibleUEs = schedulerInput.eligibleUEs;
+            eligibleUEs = initialEligibleUEs; % This list keeps on updating based on total allotted RBs and RB requirement
+            % Calculate the number of eligibleUEs for new transmission based on max
+            % allowed users per TTI
+            numEligibleUEs = min(size(eligibleUEs,2), schedulerInput.maxNumUsersTTI);
+            rbgOccupancyBitmap = schedulerInput.freqOccupancyBitmap;
+
+            % To store allotted RB count to UE in the slot
+            allottedRBCount = zeros(numEligibleUEs, 1);
+            allottedUEs = zeros(numEligibleUEs, 1);
+            mcsIndex = zeros(numEligibleUEs, 1);
+            freqAllocation = zeros(numEligibleUEs, size(rbgOccupancyBitmap,2));
+
+            scheduledUE = schedulerInput.lastSelectedUE;
+            lastSelectedUE = scheduledUE;
+            numFreeRBG = size(find(rbgOccupancyBitmap==0),2);
+            perUEMinShare = floor(numFreeRBG/numEligibleUEs);
+            assignedNumRBG = 0;
+            ueIdx = 1;
+            if schedulerInput.linkDir==0 % Initialize precoder for downlink
+                W = schedulerInput.W;
+            end
+            % Initialize a structure to store the pairing history if
+            % SRS-based DL MU-MIMO is enabled.
+            csiMeasurementSignalDLType = obj.SchedulerConfig.CSIMeasurementSignalDLType;
+            isSRSApplicable = csiMeasurementSignalDLType && any(arrayfun(@(x) ~isempty(obj.UEContext(x).CSIMeasurementDL.SRS),eligibleUEs));
+            isDefaultCSI = ~csiMeasurementSignalDLType && ~isempty(obj.UserPairingMatrix);
+            if schedulerInput.linkDir == 0 && ~isempty(obj.SchedulerConfig.MUMIMOConfigDL) && isSRSApplicable
+                pairingCache(size(rbgOccupancyBitmap, 2)) = struct('selectedUEs', [], 'selectedUEsMcs', [], 'W', []);
+            elseif schedulerInput.linkDir == 0 && ~isempty(obj.SchedulerConfig.MUMIMOConfigDL) && isDefaultCSI
+                % Initialize pairingCache as empty for CSI-RS-based DL MU-MIMO
+                pairingCache = [];
+            end
+            rbgIndexCache = zeros(size(rbgOccupancyBitmap, 2), 1);
+            rbgIdx = 1;
+            for i = 1:size(rbgOccupancyBitmap,2)
+                % Resource block group is free
+                if ~rbgOccupancyBitmap(i)
+                    assignedNumRBG = assignedNumRBG + 1;
+                    rbgIndex = i-1;
+                    rbgIndexCache(rbgIdx) = i;
+                    schedulerInput.cqiRBG = []; % Initialize CQI per RBG as empty
+
+                    for j = 1:obj.NumUEs
+                        if obj.SchedulerConfig.SchedulerStrategy == 0 % Round-robin Scheduler
+                            % Select next UE for scheduling. After the last selected UE, go in sequence
+                            % and find the first UE which is eligible and with non-zero buffer status
+                            scheduledUE = mod(scheduledUE, obj.NumUEs)+1;
+                            % Selected UE through round-robin strategy. UE must be in eligibility-list
+                            % otherwise move to the next UE
+                            scheduledUEIndex = find(initialEligibleUEs == scheduledUE, 1);
+                        else
+                            % Schedule based on the priority of each UE.
+                            % Reset index if the ueIdx reaches end of the eligible UEs list
+                            if size(eligibleUEs,2) < ueIdx
+                                ueIdx = 1;
+                            end
+
+                            if ~isempty(eligibleUEs)
+                                scheduledUE = eligibleUEs(ueIdx);
+                                scheduledUEIndex = find(initialEligibleUEs == scheduledUE, 1);
+                                ueIdx = ueIdx + 1;
+                            end
+                        end
+
+                        isPresentEligibleUEs = find(eligibleUEs == scheduledUE, 1);
+                        if (~isempty(scheduledUEIndex) && ~isempty(isPresentEligibleUEs))
+                            carrierContext =  obj.UEContext(initialEligibleUEs(scheduledUEIndex)).ComponentCarrier(1);
+                            rbgSize = carrierContext.RBGSize;
+                            numRBGs = carrierContext.NumRBGs;
+                            % Update the frequency allocation for scheduledUE
+                            if ~allottedUEs(scheduledUEIndex)
+                                allottedUEs(scheduledUEIndex) = scheduledUE;
+                                lastSelectedUE = scheduledUE;
+                            end
+                            freqAllocation(scheduledUEIndex, rbgIndex+1) = 1;
+                            selectedUEs(1) = scheduledUE;
+
+                            % Check if MU-MIMO is enabled for DL and measurements are available
+                            if schedulerInput.linkDir == 0 && ~isempty(obj.SchedulerConfig.MUMIMOConfigDL) && (isSRSApplicable || isDefaultCSI)
+                                startRBIndex = rbgSize * rbgIndex;
+                                % Last RBG can have lesser RBs as number of RBs might not
+                                % be completely divisible by RBG size
+                                lastRBIndex = min(startRBIndex + rbgSize - 1, obj.CellConfig(1).NumResourceBlocks-1);
+                                for k=1:numEligibleUEs
+                                    schedulerInput.cqiRBG(k,:) = schedulerInput.channelQuality(k, startRBIndex+1 : lastRBIndex+1);
+                                    cqiSetRBG = floor(sum(schedulerInput.cqiRBG, 2)/size(schedulerInput.cqiRBG, 2));
+                                    schedulerInput.mcsRBG(k, 1) = selectMCSIndexDL(obj, cqiSetRBG, initialEligibleUEs(k)); % MCS value
+                                end
+                                selectedUEsMcs = schedulerInput.mcsRBG(:, 1);
+
+                                % Extract number of MU-MIMO capable UEs
+                                muMIMOConfigDL = obj.SchedulerConfig.MUMIMOConfigDL;
+                                % If selected UE is MU-MIMO capable UE
+                                mumimoUEIndices = nr5g.internal.nrExtractMUMIMOUserlist(muMIMOConfigDL,schedulerInput,obj.MCSTableDL,isSRSApplicable);
+
+                                % If selected UE is MU-MIMO capable UE
+                                if mumimoUEIndices(scheduledUEIndex)
+                                    mumimoUEs = initialEligibleUEs(mumimoUEIndices==1);
+                                    mumimoUEs = intersect(mumimoUEs, initialEligibleUEs(initialEligibleUEs~=scheduledUE));
+
+                                    % Get the paired UEs, MCS, and precoders
+                                    % Updated pairing history is also obtained for SRS-based DL MU-MIMO
+                                    [selectedUEs, selectedUEsMcs, W, pairingCache] = userPairingRAT0(obj, schedulerInput, eligibleUEs, ...
+                                        scheduledUE, scheduledUEIndex, mumimoUEs, pairingCache, rbgIndex, rbgIndexCache, isDefaultCSI);
+
+                                    % Update the frequency allocation after user pairing logic
+                                    for idx=1:numel(selectedUEs)
+                                        ueIndex = find(initialEligibleUEs == selectedUEs(idx), 1);
+                                        if ~allottedUEs(ueIndex)
+                                            lastSelectedUE = selectedUEs(idx);
+                                        end
+                                        allottedUEs(ueIndex) = selectedUEs(idx);
+                                        freqAllocation(ueIndex, rbgIndex+1) = 1;
+                                        % Equal number of RBGs are distributed among eligible UEs, pick next UE
+                                        % randomly for the available RBG
+                                        if isempty(find(allottedUEs==0, 1)) && assignedNumRBG >= (perUEMinShare*numEligibleUEs)
+                                            if isempty(eligibleUEs)
+                                                scheduledUE = 0;
+                                            else
+                                                scheduledUE = eligibleUEs(randi(size(eligibleUEs,2)));
+                                            end
+                                        end
+                                    end
+                                end
+                            else % UL or SU-MIMO scenario
+                                % Equal number of RBGs are distributed among eligible UEs, pick next UE
+                                % randomly for the available RBG
+                                if isempty(find(allottedUEs==0, 1)) && assignedNumRBG >= (perUEMinShare*numEligibleUEs)
+                                    if isempty(eligibleUEs)
+                                        scheduledUE = 0;
+                                    else
+                                        scheduledUE = eligibleUEs(randi(size(eligibleUEs,2)));
+                                    end
+                                end
+                            end
+
+                            if rbgIndex < numRBGs-1
+                                allottedRBCount(scheduledUEIndex) = allottedRBCount(scheduledUEIndex) + rbgSize;
+                                % Check if the UE which got this RBG remains eligible for further RBGs in
+                                % this TTI, as per set 'RBAllocationLimit'.
+                                nextRBGSize = rbgSize;
+                                if rbgIndex == numRBGs-2 % If next RBG index is the last one in BWP
+                                    nextRBGSize = obj.CellConfig(1).NumResourceBlocks - ((rbgIndex+1)*rbgSize);
+                                end
+                                if allottedRBCount(scheduledUEIndex) > (schedulerInput.rbAllocationLimit - nextRBGSize) || ...
+                                        allottedRBCount(scheduledUEIndex) >= schedulerInput.rbRequirement(scheduledUEIndex)
+                                    % Not eligible for next RBG as either max RB allocation limit would get
+                                    % breached, or RB requirement is satisfied for the UE
+                                    eligibleUEs = setdiff(eligibleUEs, allottedUEs(scheduledUEIndex), 'stable');
+                                    % Delete UE and update the sorted list
+                                    ueIdx = ueIdx-1;
+                                end
+                            end
+
+                            if schedulerInput.linkDir == 0 % Downlink
+                                obj.LastSelectedUEDL =  lastSelectedUE;
+                            else % Uplink
+                                obj.LastSelectedUEUL =  lastSelectedUE;
+                            end
+                            break;
+                        end
+                    end
+                end
+                rbgIdx = rbgIdx + 1;
+            end
+
+            % Read the valid rows
+            indices = allottedUEs>0;
+            allottedUEs = allottedUEs(indices);
+            numAllottedUEs = numel(allottedUEs);
+            for index = 1:numAllottedUEs
+                scheduledUEIndex = find(initialEligibleUEs == allottedUEs(index), 1);
+                gNBCarrierIndex = 1;
+                allottedRBs = convertRBGBitmapToRBs(obj, allottedUEs(index), gNBCarrierIndex, freqAllocation(scheduledUEIndex,:));
+                if schedulerInput.linkDir
+                    % UL MCS index
+                    mcsIndex(scheduledUEIndex) = schedulerInput.mcsIndexArray(scheduledUEIndex);
+                else
+                    % Calculate average DL CQI for the allotted resource blocks
+                    cqiRB = schedulerInput.channelQuality(scheduledUEIndex, allottedRBs+1);
+                    cqiSetRB = floor(mean(cqiRB, 2));
+                    % Calculate average DL MCS value
+                    mcsIndex(scheduledUEIndex) = selectMCSIndexDL(obj, cqiSetRB, allottedUEs(index));
+                end
+            end
+            % For SRS-based DL MU-MIMO, use the MCS obtained from the
+            % pairing function
+            if schedulerInput.linkDir == 0 && ~isempty(obj.SchedulerConfig.MUMIMOConfigDL) && isSRSApplicable
+                mcsIndex = selectedUEsMcs;
+            end
+
+            % Read the valid rows
+            freqAllocation = freqAllocation(indices,:);
+            mcsIndex = mcsIndex(indices);
+        end
+
+        function [allottedUEs, freqAllocation, mcsIndex, W] = runSchedulingStrategyRAT1(obj, schedulerInput)
+            %runSchedulingStrategyRAT1 Implements the round-robin. proportional fair and best CQI strategy for RAT-1 scheduling scheme
+            %
+            %   [ALLOTTEDUEs, FREQALLOCATION, MCSINDEX, W] =
+            %   runSchedulingStrategyRAT1(OBJ, SCHEDULERINPUT) returns the allotted UEs
+            %   with their frequency allocation for this slot, along with the suitable
+            %   mcsIndex and precoding matrices based on the channel condition. The precoding
+            %   matrices are assigned only for MU-MIMO in DL. This function gets called for
+            %   selecting UEs for new transmission, i.e., once for each slot after
+            %   assignment for retransmissions is completed.
+            %   schedulerInput structure contains the following fields which scheduler
+            %   would use for selecting the UE to which RBs would be assigned.
+            %
+            %       eligibleUEs          - RNTI of the eligible UEs contending for the available RBs
+            %       rbRequirement        - RB requirement of UEs as per their buffered amount and CQI-based MCS
+            %       bufferStatus         - Buffer-Status of UEs. Vector of N elements where 'N'
+            %                              is the number of eligible UEs, containing pending
+            %                              buffer status for UEs
+            %       freqOccupancyBitmap  - Holds RB occupancy status after RBs got
+            %                              allotted for retransmission
+            %       rbAllocationLimit    - Maximum number of RBs allotted to a UE in a particular slot
+            %       channelQuality       - Channel quality information of the eligible UEs.
+            %                              Vector of N elements where 'N' is the number of eligible UEs
+            %       lastSelectedUE       - The RNTI of the UE which was assigned the last scheduled RB
+            %       linkDir              - Link direction as DL (value 0) or UL (value 1)
+            %       maxNumUsersTTI       - Number of UEs that can be scheduled in this TTI for new Tx
+
+            % Calculate the number of eligibleUEs for new transmission based on max
+            % allowed users per TTI
+            eligibleUEs = schedulerInput.eligibleUEs;
+            numEligibleUEs = min(size(eligibleUEs,2), schedulerInput.maxNumUsersTTI);
+
+            % To store allotted RB count to UE in the slot
+            [allottedRBCount, allottedUEs, mcsIndex] = deal(zeros(numEligibleUEs, 1));
+            if schedulerInput.linkDir==0 % Initialize precoder for downlink
+                W = schedulerInput.W;
+            end
+            csiMeasurementSignalDLType = obj.SchedulerConfig.CSIMeasurementSignalDLType;
+            % Determine if SRS-based or default CSI-RS-based measurement is applicable
+            isSRSApplicable = csiMeasurementSignalDLType && any(arrayfun(@(x) ~isempty(obj.UEContext(x).CSIMeasurementDL.SRS),eligibleUEs));
+            isDefaultCSI = ~csiMeasurementSignalDLType && ~isempty(obj.UserPairingMatrix);
+            freqAllocation = zeros(numEligibleUEs, 2);
+            pairedStatus = zeros(numEligibleUEs, 1);
+
+            if numEligibleUEs > 0
+                rbOccupancyBitmap = schedulerInput.freqOccupancyBitmap;
+                % First unoccupied RB in the rbOccupancyBitmap
+                startRBIndex = find(rbOccupancyBitmap==0, 1)-1;
+                % Number of available RBs in the rbOccupancyBitmap
+                availableRBs = sum(~rbOccupancyBitmap);
+                eligibleUEs = schedulerInput.eligibleUEs;
+
+                if numEligibleUEs > availableRBs
+                    % Allot 1 RB each till available RBs are exhausted
+                    allottedUEs = eligibleUEs(1:availableRBs);
+                    allottedRBCount(1:availableRBs) = 1;
+                else
+                    nextUEIndex = 0;
+                    rbRequirement = schedulerInput.rbRequirement;
+                    % Shuffle the eligible UEs so that UEs listed first in list do not get
+                    % unfair advantage for extra RBs after equal distribution
+                    randomOrder = randperm(size(eligibleUEs,2));
+                    eligibleUEs = eligibleUEs(randomOrder);
+                    for i=1:availableRBs
+                        nextUEIndex = mod(nextUEIndex+1,numEligibleUEs);
+                        if nextUEIndex == 0
+                            nextUEIndex = numEligibleUEs;
+                        end
+                        if allottedRBCount(nextUEIndex) < rbRequirement(eligibleUEs(nextUEIndex))
+                            % RB requirement is not satisfied yet for the UE
+                            allottedRBCount(nextUEIndex) = allottedRBCount(nextUEIndex) + 1;
+                        else
+                            % RB requirement is satisfied for the UE. Give the RB to the next UE in
+                            % round-robin order
+                            for j=1:numEligibleUEs-1
+                                nextUEIndex = mod(nextUEIndex+1, numEligibleUEs);
+                                if nextUEIndex == 0
+                                    nextUEIndex = numEligibleUEs;
+                                end
+                                if allottedRBCount(nextUEIndex) < rbRequirement(eligibleUEs(nextUEIndex))
+                                    allottedRBCount(nextUEIndex) = allottedRBCount(nextUEIndex) + 1;
+                                    break;
+                                end
+                            end
+                        end
+                    end
+                    % Rearrange as per the original order
+                    eligibleUEs(randomOrder) = eligibleUEs(1:numEligibleUEs);
+                    allottedRBCount(randomOrder) = allottedRBCount(1:numEligibleUEs);
+                    allottedUEs = eligibleUEs;
+                end
+
+                if schedulerInput.linkDir==0 && ~isempty(obj.SchedulerConfig.MUMIMOConfigDL)
+                    % Check conditions for downlink scheduling with MU-MIMO configuration
+                    if (isSRSApplicable || isDefaultCSI)
+                        mcsInfo = obj.MCSTableDL;
+                        [allottedUEs, allottedRBCount, pairedStatus, W, pairedUEsMcs] = nr5g.internal.nrUserPairingRAT1(...
+                            obj.SchedulerConfig.MUMIMOConfigDL, obj.UEContext, schedulerInput, ...
+                            allottedRBCount, availableRBs, mcsInfo, eligibleUEs, obj.UserPairingMatrix, isSRSApplicable);
+                    end
+                end
+
+                % AllottedRBCount should not exceed allocation limit
+                allottedRBCount(allottedRBCount>schedulerInput.rbAllocationLimit) = schedulerInput.rbAllocationLimit;
+
+                numAllottedUEs = numel(allottedUEs);
+                for index = 1:numAllottedUEs
+                    allottedRB = allottedRBCount(index);
+                    % Allot RBs to the selected UE in this TTI
+                    freqAllocation(index, :) = [startRBIndex allottedRB];
+                    if schedulerInput.linkDir
+                        % UL MCS index
+                        mcsIndex(index) = schedulerInput.mcsIndexArray(allottedUEs(index));
+                    else
+                        % Calculate average DL CQI for the allotted resource blocks
+                        cqiRB = schedulerInput.channelQuality(allottedUEs(index), startRBIndex+1:startRBIndex+allottedRB);
+                        cqiSetRB = floor(mean(cqiRB, 2));
+                        % Calculate average DL MCS value
+                        mcsIndex(index) = selectMCSIndexDL(obj, cqiSetRB, allottedUEs(index));
+                    end
+                    if ~pairedStatus(index)
+                        startRBIndex = startRBIndex+allottedRB;
+                    end
+                end
+
+                % For SRS-based DL MU-MIMO, use the MCS obtained from the
+                % pairing function
+                if schedulerInput.linkDir == 0 && ~isempty(obj.SchedulerConfig.MUMIMOConfigDL) && isSRSApplicable
+                    mcsIndex = pairedUEsMcs;
+                end
+                % Read the valid rows
+                freqAllocation = freqAllocation(1:numAllottedUEs, :);
+                mcsIndex = mcsIndex(1:numAllottedUEs);
+
+                % Assign the RNTI of UE which was assigned the last frequency resource
+                if allottedUEs % Only update when there is resource assignment
+                    if schedulerInput.linkDir == 0 % Downlink
+                        obj.LastSelectedUEDL =  allottedUEs(numAllottedUEs);
+                    else % Uplink
+                        obj.LastSelectedUEUL =  allottedUEs(numAllottedUEs);
+                    end
+                end
+            end
+        end
+    end
+
+    methods (Access = protected, Hidden)
+        function selectedSlots = selectULSlotsToBeScheduled(obj, gNBCarrierIndex)
+            %selectULSlotsToBeScheduled Select UL slots to be scheduled
+            % SELECTEDSLOTS = selectULSlotsToBeScheduled(OBJ,GNBCARRIERINDEX) selects
+            % the slots to be scheduled by UL scheduler in the current run for the
+            % specified carrier, GNBCARRIERINDEX. The time of current scheduler run is inferred from the
+            % values of object properties: CurrFrame, CurrSlot and CurrSymbol.
+            %
+            % SELECTEDSLOTS is a N-by-2 matrix. Each row represents a slot selected for
+            % scheduling in the current invocation of UL scheduler by MAC. The two
+            % columns represent following information about the slot to be scheduled:
+            % Absolute frame number and the slot number in it.
+
+            if obj.CellConfig(gNBCarrierIndex).DuplexModeNumber % TDD
+                selectedSlots = selectULSlotsToBeScheduledTDD(obj, gNBCarrierIndex);
+            else % FDD
+                selectedSlots = selectULSlotsToBeScheduledFDD(obj, gNBCarrierIndex);
+            end
+        end
+
+        function selectedSlots = selectDLSlotsToBeScheduled(obj, gNBCarrierIndex)
+            %selectDLSlotsToBeScheduled Select DL slots to be scheduled
+            % SELECTEDSLOTS = selectDLSlotsToBeScheduled(OBJ,GNBCARRIERINDEX) selects
+            % the slots to be scheduled by DL scheduler in the current run for the
+            % specified carrier, GNBCARRIERINDEX. The time of current scheduler run is
+            % inferred from the values of object properties: CurrFrame, CurrSlot and
+            % CurrSymbol.
+            %
+            % SELECTEDSLOTS is a N-by-2 matrix. Each row represents a slot selected for
+            % scheduling in the current invocation of DL scheduler by MAC. The two
+            % columns represent following information about the slot to be scheduled:
+            % Absolute frame number and the slot number in it.
+
+            if obj.CellConfig(gNBCarrierIndex).DuplexModeNumber % TDD
+                selectedSlots = selectDLSlotsToBeScheduledTDD(obj, gNBCarrierIndex);
+            else % FDD
+                selectedSlots = selectDLSlotsToBeScheduledFDD(obj, gNBCarrierIndex);
+            end
+        end
+
+        function uplinkGrants = scheduleULResourcesSlot(obj, nFrame, nSlot, gNBCarrierIndex)
+            %scheduleULResourcesSlot Schedule UL resources of a slot
+            %   UPLINKGRANTS =
+            %   scheduleULResourcesSlot(OBJ,NFRAME,NSLOT,GNBCARRIERINDEX) assigns UL
+            %   resources for the carrier at index, GNBCARRIERINDEX, for the slot,
+            %   NSLOT, in the absolute frame number, NFRAME. If the slot is
+            %   jointly scheduled across multiple carriers then GNBCarrierIndex is a
+            %   vector of carrier indices.
+            %
+            %   NFRAME is the 0-based absolute frame number.
+            %
+            %   NSLOT is the 0-based slot number in the 10 ms frame defined by NFRAME,
+            %   whose UL resources are getting scheduled. For FDD, all the symbols can
+            %   be used for UL. For TDD, the UL resources can stretch the full slot or
+            %   might just be limited to few symbols in the slot. The time of current
+            %   scheduler run is inferred from the value of object properties: CurrFrame,
+            %   CurrSlot and CurrSymbol.
+            %
+            %   GNBCARRIERINDEX is the index of the carriers among the carriers
+            %   operated by gNB.
+            %   UPLINKGRANTS is a structure vector where each structure element
+            %   represents an uplink grant and has following fields:
+            %       RNTI                - Uplink grant is for this UE
+            %       GNBCarrierIndex     - Index of the scheduled carrier in the obj.CellConfig vector
+            %       Type                - Whether assignment is for new transmission ('newTx'),
+            %                             retransmission ('reTx')
+            %       HARQID              - Selected uplink HARQ process ID
+            %       FrequencyAllocation - For RAT-0, a bitmap of resource-block-groups of the PUSCH bandwidth.
+            %                             Value 1 indicates RBG is assigned to the UE
+            %                           - For RAT-1, a vector of two elements representing start RB and
+            %                             number of RBs
+            %       StartSymbol         - Start symbol of time-domain resources
+            %       NumSymbols          - Number of symbols allotted in time-domain
+            %       SlotOffset          - Slot-offset of PUSCH assignment
+            %                             w.r.t the current slot
+            %       MCSIndex            - Selected modulation and coding scheme index for UE with
+            %                           - respect to the resource assignment done
+            %       NDI                 - New data indicator flag
+            %       RV                  - Redundancy version
+            %       DMRSLength          - DM-RS length
+            %       MappingType         - Mapping type
+            %       NumLayers           - Number of layers
+            %       NumAntennaPorts     - Number of antenna ports for UE
+            %       TPMI                - Transmitted precoding matrix indicator
+            %       NumCDMGroupsWithoutData  -  Number of DM-RS code division multiplexing (CDM) groups without data
+
+            timeFrequencyResource = repmat(obj.TimeFrequencyResourceStruct, numel(gNBCarrierIndex), 1);
+            carrierCount = 0;
+            for j=1:numel(gNBCarrierIndex)
+                % Calculate offset of the slot to be scheduled, from the current slot
+                slotOffset = nSlot - obj.CurrSlot;
+                cellConfig = obj.CellConfig(gNBCarrierIndex(j));
+                schedulerConfig = obj.SchedulerConfig;
+                if nSlot < obj.CurrSlot % Slot to be scheduled is in the next frame
+                    slotOffset = slotOffset + cellConfig.NumSlotsFrame;
+                end
+
+                % Get start UL symbol and number of UL symbols in the slot
+                if cellConfig.DuplexModeNumber % TDD
+                    DLULPatternIndex = mod(cellConfig.CurrDLULSlotIndex + slotOffset, cellConfig.NumDLULPatternSlots);
+                    slotFormat = cellConfig.DLULSlotFormat(DLULPatternIndex + 1, :);
+                    firstULSym = find(slotFormat == obj.ULType, 1, 'first') - 1; % Index of first UL symbol in the slot
+                    lastULSym = find(slotFormat == obj.ULType, 1, 'last') - 1; % Index of last UL symbol in the slot
+                    numULSym = lastULSym - firstULSym + 1;
+                else % FDD
+                    % All symbols are UL symbols
+                    firstULSym = 0;
+                    numULSym = 14;
+                end
+
+                % Check if the current slot has any reserved symbol for SRS
+                numSlotFrames = cellConfig.NumSlotsFrame; % Number of slots per 10ms frame
+                for i=1:size(cellConfig.ULReservedResource, 1)
+                    reservedResourceInfo = cellConfig.ULReservedResource(i, :);
+                    if (mod(numSlotFrames*nFrame + nSlot - reservedResourceInfo(3), reservedResourceInfo(2)) == 0) % SRS slot check
+                        reservedSymbol = reservedResourceInfo(1);
+                        if (reservedSymbol >= firstULSym) && (reservedSymbol <= firstULSym+numULSym-1)
+                            numULSym = reservedSymbol - firstULSym; % Allow PUSCH to only span till the symbol before the SRS symbol
+                        end
+                        break; % Only 1 symbol for SRS per slot
+                    end
+                end
+                if ~(schedulerConfig.PUSCHMappingType =='A' && (firstULSym~=0 || numULSym<4))
+                    % PUSCH Mapping type A transmissions always start at symbol 0 and
+                    % number of symbols must be >=4, as per TS 38.214 - Table 6.1.2.1-1
+                    carrierCount = carrierCount+1;
+                    timeFrequencyResource(carrierCount).GNBCarrierIndex = gNBCarrierIndex(j);
+                    timeFrequencyResource(carrierCount).NFrame = nFrame;
+                    timeFrequencyResource(carrierCount).NSlot = nSlot;
+                    timeFrequencyResource(carrierCount).SymbolAllocation = [firstULSym numULSym];
+                end
+            end
+            if carrierCount>0
+                uplinkGrants = assignULResourceTTI(obj, timeFrequencyResource(1:carrierCount));
+            else
+                uplinkGrants = repmat(obj.ULGrantInfoStruct, 1, 0); % Return empty
+            end
+        end
+
+        function downlinkAssignments = scheduleDLResourcesSlot(obj, nFrame, nSlot, gNBCarrierIndex)
+            %scheduleDLResourcesSlot Schedule DL resources of a slot
+            %   DOWNLINKASSIGNMENTS =
+            %   scheduleDLResourcesSlot(OBJ,NFRAME,NSLOT,GNBCARRIERINDEX) assigns DL
+            %   resources for the carrier at index, GNBCARRIERINDEX, for the slot,
+            %   NSLOT, in the absolute frame number, NFRAME. If the slot is
+            %   jointly scheduled across multiple carriers then GNBCarrierIndex is a
+            %   vector of carrier indices.
+            %
+            %   NFRAME is the 0-based absolute frame number.
+            %
+            %   NSLOT is the 0-based slot number in the 10 ms frame defined by NFRAME,
+            %   whose DL resources are getting scheduled. For FDD, all the symbols can
+            %   be used for DL. For TDD, the DL resources can stretch the full slot or
+            %   might just be limited to few symbols in the slot. The time of current
+            %   scheduler run is inferred from the value of object properties: CurrFrame,
+            %   CurrSlot and CurrSymbol.
+            %
+            %   GNBCARRIERINDEX is the index of the carrier(s) among the carriers
+            %   operated by gNB.
+            %
+            %   DOWNLINKASSIGNMENTS is a structure vector where each structure element
+            %   represents a downlink assignment and has following fields:
+            %
+            %       RNTI                - Downlink assignment is for this UE
+            %       GNBCarrierIndex     - Index of the scheduled carrier in the obj.CellConfig vector
+            %       Type                  Whether assignment is for new transmission ('newTx'),
+            %                             retransmission ('reTx')
+            %       HARQID              - Selected downlink HARQ process ID
+            %       FrequencyAllocation - For RAT-0, a bitmap of resource-block-groups of the PDSCH bandwidth.
+            %                             Value 1 indicates RBG is assigned to the UE
+            %                           - For RAT-1, a vector of two elements representing start RB and
+            %                             number of RBs
+            %       StartSymbol         - Start symbol of time-domain resources
+            %       NumSymbols          - Number of symbols allotted in time-domain
+            %       SlotOffset          - Slot offset of PDSCH assignment
+            %                             w.r.t the current slot
+            %       MCSIndex            - Selected modulation and coding scheme index for UE with
+            %                             respect to the resource assignment done
+            %       NDI                 - New data indicator flag
+            %       RV                  - Redundancy version
+            %       FeedbackSlotOffset  - Slot offset of PDSCH ACK/NACK from
+            %                             PDSCH transmission slot (i.e. k1).
+            %                             Currently, only a value >=2 is supported
+            %       DMRSLength          - DM-RS length
+            %       MappingType         - Mapping type
+            %       NumLayers           - Number of transmission layers
+            %       NumCDMGroupsWithoutData - Number of CDM groups without data (1...3)
+            %       W               - Selected precoding matrix.
+            %                         It is an array of size NumLayers-by-P-by-NPRG, where NPRG is the
+            %                         number of PRGs in the carrier and P is the number of CSI-RS
+            %                         ports. It defines a different precoding matrix of size
+            %                         NumLayers-by-P for each PRG. The effective PRG bundle size
+            %                         (precoder granularity) is Pd_BWP = ceil(NRB / NPRG).
+            %                         For SISO, set it to 1
+            %       BeamIndex       - Index in the beam weight table configured at PHY. If empty, no
+            %                         beamforming is performed on the PDSCH transmission.
+
+            timeFrequencyResource = repmat(obj.TimeFrequencyResourceStruct, numel(gNBCarrierIndex), 1);
+            for i=1:numel(gNBCarrierIndex)
+                % Calculate offset of the slot to be scheduled, from the current slot
+                slotOffset = nSlot - obj.CurrSlot;
+                cellConfig = obj.CellConfig(gNBCarrierIndex(i));
+                if nSlot < obj.CurrSlot % Slot to be scheduled is in the next frame
+                    slotOffset = slotOffset + cellConfig.NumSlotsFrame;
+                end
+
+                % Get start DL symbol and number of DL symbols in the slot
+                if cellConfig.DuplexModeNumber % TDD mode
+                    DLULPatternIndex = mod(cellConfig.CurrDLULSlotIndex + slotOffset, cellConfig.NumDLULPatternSlots);
+                    slotFormat = cellConfig.DLULSlotFormat(DLULPatternIndex + 1, :);
+                    firstDLSym = find(slotFormat == obj.DLType, 1, 'first') - 1; % Location of first DL symbol in the slot
+                    lastDLSym = find(slotFormat == obj.DLType, 1, 'last') - 1; % Location of last DL symbol in the slot
+                    numDLSym = lastDLSym - firstDLSym + 1;
+                else
+                    % For FDD, all symbols are DL symbols
+                    firstDLSym = 0;
+                    numDLSym = 14;
+                end
+                timeFrequencyResource(i).GNBCarrierIndex = gNBCarrierIndex(i);
+                timeFrequencyResource(i).NFrame = nFrame;
+                timeFrequencyResource(i).NSlot = nSlot;
+                timeFrequencyResource(i).SymbolAllocation = [firstDLSym numDLSym];
+            end
+            downlinkAssignments = assignDLResourceTTI(obj, timeFrequencyResource);
+        end
+
+        function selectedSlots = selectULSlotsToBeScheduledFDD(obj, gNBCarrierIndex)
+            %selectULSlotsToBeScheduledFDD Select the set of slots to be scheduled by UL scheduler (for FDD mode)
+
+            numSlotsFrame = obj.CellConfig(gNBCarrierIndex).NumSlotsFrame;
+            selectedSlots = zeros(numSlotsFrame, 2);
+            numSelectedSlots = 0;
+            schedulerConfig = obj.SchedulerConfig;
+            schedulerConfig.SlotsSinceSchedulerRunUL = schedulerConfig.SlotsSinceSchedulerRunUL + 1;
+            if schedulerConfig.SlotsSinceSchedulerRunUL == schedulerConfig.SchedulerPeriodicity
+                % Scheduler periodicity reached. Select the same number of slots as the
+                % scheduler periodicity. Offset of slots to be scheduled in this scheduler
+                % run must be such that UEs get required PUSCH preparation time
+                firstScheduledSlotOffset = max(1, ceil(obj.PUSCHPreparationTime/14));
+                lastScheduledSlotOffset = firstScheduledSlotOffset + schedulerConfig.SchedulerPeriodicity - 1;
+                for slotOffset = firstScheduledSlotOffset:lastScheduledSlotOffset
+                    numSelectedSlots = numSelectedSlots+1;
+                    nFrame = obj.CurrFrame + floor((obj.CurrSlot + slotOffset)./numSlotsFrame);
+                    nSlot = mod(obj.CurrSlot + slotOffset, numSlotsFrame);
+                    selectedSlots(numSelectedSlots, :) = [nFrame nSlot];
+                end
+                schedulerConfig.SlotsSinceSchedulerRunUL = 0;
+            end
+            selectedSlots = selectedSlots(1:numSelectedSlots, :);
+        end
+
+        function selectedSlots = selectDLSlotsToBeScheduledFDD(obj, gNBCarrierIndex)
+            %selectDLSlotsToBeScheduledFDD Select the slots to be scheduled by DL scheduler (for FDD mode)
+
+            numSlotsFrame = obj.CellConfig(gNBCarrierIndex).NumSlotsFrame;
+            selectedSlots = zeros(numSlotsFrame, 2);
+            numSelectedSlots = 0;
+            schedulerConfig = obj.SchedulerConfig;
+            schedulerConfig.SlotsSinceSchedulerRunDL = schedulerConfig.SlotsSinceSchedulerRunDL + 1;
+            if schedulerConfig.SlotsSinceSchedulerRunDL == schedulerConfig.SchedulerPeriodicity
+                % Scheduler periodicity reached. Select the slots till the slot when
+                % scheduler would run next
+                for slotOffset = 1:schedulerConfig.SchedulerPeriodicity
+                    numSelectedSlots = numSelectedSlots+1;
+                    nframe = obj.CurrFrame + floor((obj.CurrSlot + slotOffset)./numSlotsFrame);
+                    slot = mod(obj.CurrSlot + slotOffset, numSlotsFrame);
+                    selectedSlots(numSelectedSlots, :) = [nframe slot];
+                end
+                schedulerConfig.SlotsSinceSchedulerRunDL = 0;
+            end
+            selectedSlots = selectedSlots(1:numSelectedSlots, :);
+        end
+
+        function selectedSlots = selectULSlotsToBeScheduledTDD(obj, gNBCarrierIndex)
+            %selectULSlotsToBeScheduledTDD Get the set of slots to be scheduled by UL scheduler (for TDD mode)
+            % The criterion used here selects all the upcoming slots (including the
+            % current one) containing unscheduled UL symbols which must be scheduled
+            % now. These slots can be scheduled now but cannot be scheduled in the next
+            % slot with DL symbols, based on PUSCH preparation time capability of UEs
+            % (It is assumed that all the UEs have same PUSCH preparation capability).
+
+            cellConfig = obj.CellConfig(gNBCarrierIndex);
+            numSlotsFrame = cellConfig.NumSlotsFrame;
+            selectedSlots = zeros(numSlotsFrame, 2);
+            numSlotsSelected = 0;
+            % Do the scheduling in the slot starting with DL symbol
+            if find(cellConfig.DLULSlotFormat(cellConfig.CurrDLULSlotIndex+1, 1) == obj.DLType, 1)
+                % Calculate how far the next DL slot is
+                nextDLSlotOffset = 1;
+                while nextDLSlotOffset < numSlotsFrame % Consider only the slots within 10 ms
+                    slotIndex = mod(cellConfig.CurrDLULSlotIndex + nextDLSlotOffset, cellConfig.NumDLULPatternSlots);
+                    if find(cellConfig.DLULSlotFormat(slotIndex + 1, :) == obj.DLType, 1)
+                        break; % Found a slot with DL symbols
+                    end
+                    nextDLSlotOffset = nextDLSlotOffset + 1;
+                end
+                nextDLSymOffset = (nextDLSlotOffset * 14); % Convert to number of symbols
+
+                % Calculate how many slots ahead is the next to-be-scheduled slot
+                nextULSchedSlotOffset = cellConfig.NextULSchedulingSlot - obj.CurrSlot;
+                if obj.CurrSlot > cellConfig.NextULSchedulingSlot  % Slot is in the next frame
+                    nextULSchedSlotOffset = nextULSchedSlotOffset + numSlotsFrame;
+                end
+
+                % Start evaluating candidate future slots one-by-one, to check if they must
+                % be scheduled now, starting from the slot which is 'nextULSchedSlotOffset'
+                % slots ahead
+                while nextULSchedSlotOffset < numSlotsFrame
+                    % Get slot index of candidate slot in DL-UL pattern and its format
+                    slotIdxDLULPattern = mod(cellConfig.CurrDLULSlotIndex + nextULSchedSlotOffset, cellConfig.NumDLULPatternSlots);
+                    slotFormat = cellConfig.DLULSlotFormat(slotIdxDLULPattern + 1, :);
+
+                    firstULSym = find(slotFormat == obj.ULType, 1, 'first'); % Check for location of first UL symbol in the candidate slot
+                    if firstULSym % If slot has any UL symbol
+                        nextULSymOffset = (nextULSchedSlotOffset * 14) + firstULSym - 1;
+                        if (nextULSymOffset - nextDLSymOffset) < obj.PUSCHPreparationTime
+                            % The UL resources of this candidate slot cannot be scheduled in the first
+                            % upcoming slot with DL symbols. Check if it can be scheduled now. If so,
+                            % add it to the list of selected slots
+                            if nextULSymOffset >= obj.PUSCHPreparationTime
+                                numSlotsSelected = numSlotsSelected + 1;
+                                nframe = obj.CurrFrame + floor((obj.CurrSlot + nextULSchedSlotOffset)./numSlotsFrame);
+                                slot = mod(obj.CurrSlot + nextULSchedSlotOffset, numSlotsFrame);
+                                selectedSlots(numSlotsSelected, :) = [nframe slot];
+                            end
+                        else
+                            % Slots which are 'nextULSchedSlotOffset' or more slots ahead can be
+                            % scheduled in next slot with DL symbols as scheduling there will also be
+                            % able to give enough PUSCH preparation time for UEs.
+                            break;
+                        end
+                    end
+                    nextULSchedSlotOffset = nextULSchedSlotOffset + 1; % Move to the next slot
+                end
+            end
+            selectedSlots = selectedSlots(1 : numSlotsSelected, :); % Keep only the selected slots in the array
+        end
+
+        function selectedSlots = selectDLSlotsToBeScheduledTDD(obj, gNBCarrierIndex)
+            %selectDLSlotsToBeScheduledTDD Select the slots to be scheduled by DL scheduler (for TDD mode)
+            % Return the slot number of next slot with DL resources
+            % (symbols). In every run the DL scheduler schedules the next
+            % slot with DL symbols.
+
+            selectedSlots = [];
+            cellConfig = obj.CellConfig(gNBCarrierIndex);
+            numSlotsFrame = cellConfig.NumSlotsFrame;
+            % Do the scheduling in the slot starting with DL symbol
+            if find(cellConfig.DLULSlotFormat(cellConfig.CurrDLULSlotIndex+1, 1) == obj.DLType, 1)
+                % Calculate how far the next DL slot is
+                nextDLSlotOffset = 1;
+                while nextDLSlotOffset < numSlotsFrame % Consider only the slots within 10 ms
+                    slotIndex = mod(cellConfig.CurrDLULSlotIndex + nextDLSlotOffset, cellConfig.NumDLULPatternSlots);
+                    if find(cellConfig.DLULSlotFormat(slotIndex + 1, :) == obj.DLType, 1)
+                        % Found a slot with DL symbols, calculate the slot
+                        % number
+                        nframe = obj.CurrFrame + floor((obj.CurrSlot + nextDLSlotOffset)./numSlotsFrame);
+                        slot = mod(obj.CurrSlot + nextDLSlotOffset, numSlotsFrame);
+                        selectedSlots = [nframe slot];
+                        break;
+                    end
+                    nextDLSlotOffset = nextDLSlotOffset + 1;
+                end
+            end
+        end
+
+        function selectedSlot = getToBeSchedULSlotNextRun(obj, lastSchedULSlot, gNBCarrierIndex)
+            %getToBeSchedULSlotNextRun Get the first slot to be scheduled by UL scheduler in the next run (for TDD mode)
+            % Based on the last scheduled UL slot, get the slot number of
+            % the next UL slot (which would be scheduled in the next
+            % UL scheduler run)
+
+            cellConfig = obj.CellConfig(gNBCarrierIndex);
+            numSlotsFrame = cellConfig.NumSlotsFrame;
+            % Calculate offset of the last scheduled slot
+            if lastSchedULSlot >= obj.CurrSlot
+                lastSchedULSlotOffset = lastSchedULSlot - obj.CurrSlot;
+            else
+                lastSchedULSlotOffset = (numSlotsFrame + lastSchedULSlot) - obj.CurrSlot;
+            end
+
+            candidateSlotOffset = lastSchedULSlotOffset + 1;
+            % Slot index in DL-UL pattern
+            candidateSlotDLULIndex = mod(cellConfig.CurrDLULSlotIndex + candidateSlotOffset, cellConfig.NumDLULPatternSlots);
+            while isempty(find(cellConfig.DLULSlotFormat(candidateSlotDLULIndex+1,:) == obj.ULType, 1))
+                % Slot does not have UL symbols. Check the next slot
+                candidateSlotOffset = candidateSlotOffset + 1;
+                candidateSlotDLULIndex = mod(cellConfig.CurrDLULSlotIndex + candidateSlotOffset, cellConfig.NumDLULPatternSlots);
+            end
+            selectedSlot = mod(obj.CurrSlot + candidateSlotOffset, numSlotsFrame);
+        end
+
+        function ulGrantsTTI = assignULResourceTTI(obj, timeFrequencyResource)
+            %assignULResourceTTI Perform the uplink scheduling of a set of contiguous UL symbols representing a TTI, of the specified slot
+
+            ulGrantsTTI = repmat(obj.ULGrantInfoStruct, 1, 0);
+            ttiSymbols = zeros(numel(obj.CellConfig), 2); % StartSym and numSym
+            %% Schedule retransmissions independently for all the carriers.
+            % Schedule the retransmission of a packet on the same carrier as was
+            % used for original packet. For each carrier, keep track of remaining
+            % available resources for new transmissions
+            newTxCarrierIndices = []; % Maintains carrier indices eligible for newTx
+            numReTxGrants = 0;
+            schedulingInfo = repmat(obj.SchedulingInfoStruct, numel(timeFrequencyResource), 1); % Initialize per-carrier schedulingInfo for newTx
+            for j=1:numel(timeFrequencyResource) % Schedule reTx for each carrier
+                carrierIndex = timeFrequencyResource(j).GNBCarrierIndex;
+                % Initialize frequency resource for the carriers (Assume that all the RB/RBGs are available)
+                if obj.SchedulerConfig.ResourceAllocationType % RAT-1
+                    timeFrequencyResource(j).FrequencyResource = zeros(1, obj.CellConfig(carrierIndex).NumResourceBlocks);
+                else
+                    timeFrequencyResource(j).FrequencyResource = zeros(1, obj.UEContext(1).ComponentCarrier(carrierIndex).NumRBGs);
+                end
+                [reTxUEs, frequencyAllocationBitmap, reTxULGrants] = scheduleRetransmissionsUL(obj, timeFrequencyResource(j));
+
+                ueContext = obj.UEContext;
+                for i = 1:numel(reTxULGrants)
+                    reTxGrant = reTxULGrants(i);
+                    % Calculate PRBSet for each grant. The PRBSet is sent as part of the grant
+                    % for runtime optimization. This saves the gNB and UE from re-calculating
+                    % PRBSet using grant details
+                    reTxULGrants(i).PRBSet = obj.calculateGrantPRBSet(reTxGrant);
+                    ueInfo = ueContext(reTxGrant.RNTI);
+                    % Clear the retransmission context for the HARQ process of the selected UE
+                    % to make it ineligible for retransmission assignments (Retransmission
+                    % context would again get set, if Rx fails again in future for this
+                    % retransmission assignment)
+                    ueInfo.clearRetransmissionContext(obj.ULType, reTxGrant.HARQID, reTxGrant.GNBCarrierIndex);
+                    numReTxGrants = numReTxGrants+1;
+                    ulGrantsTTI(numReTxGrants, 1) = reTxULGrants(i);
+                end
+                ttiSymbols(carrierIndex, :) = timeFrequencyResource(j).SymbolAllocation;
+                % Populate context for new transmissions for the carrier
+                if any(~frequencyAllocationBitmap) % If any RB is free in the carrier
+                    eligibleUEs = getNewTxEligibleUEs(obj, carrierIndex, obj.ULType, reTxUEs);
+                    if ~isempty(eligibleUEs) % If there are any eligible UEs
+                        newTxCarrierIndices(end+1) = j; % Store index of eligible carrier for newTx
+                        timeFrequencyResource(j).FrequencyResource = frequencyAllocationBitmap;
+                        schedulerConfig = obj.SchedulerConfig;
+                        numUEsRetx = numel(reTxUEs);
+                        % Maximum number of UEs which could be scheduled for new-Tx
+                        maxNumUEsNewTx = obj.SchedulerConfig.MaxNumUsersPerTTI - numUEsRetx;
+                        schedulingInfo(j).EligibleUEs = eligibleUEs;
+                        schedulingInfo(j).MaxNumUsersTTI = maxNumUEsNewTx;
+                    end
+                end
+            end
+            % Filter out carriers ineligible carriers for newTx
+            timeFrequencyResource = timeFrequencyResource(newTxCarrierIndices);
+            schedulingInfo = schedulingInfo(newTxCarrierIndices);
+
+            %% Schedule new transmissions jointly for all the carriers
+            if ~isempty(newTxCarrierIndices)
+                if obj.IsSingleCarrierFormatNewTxUL  % Signature supporting single carrier
+                    timeFrequencyResource = timeFrequencyResource(1);
+                    frequencyResource = timeFrequencyResource.FrequencyResource;
+                    timeResource = rmfield(timeFrequencyResource, 'FrequencyResource');
+                    newTxULGrants= scheduleNewTransmissionsUL(obj, timeResource, frequencyResource, schedulingInfo(1));
+                else % Signature supporting multiple carriers
+                    newTxULGrants= scheduleNewTransmissionsUL(obj, timeFrequencyResource, schedulingInfo);
+                end
+                if ~isempty(newTxULGrants)
+                    if obj.EnableSchedulingValidation
+                        % Validate generated scheduling assignments
+                        nr5g.internal.nrSchedulerValidation.validateULGrants(newTxULGrants, timeFrequencyResource, schedulingInfo, obj);
+                    end
+                    % Calculate offset of scheduled slot from the current slot
+                    frameOffset = (timeFrequencyResource(1).NFrame-obj.CurrFrame);
+                    slotOffset = frameOffset*obj.CellConfig(timeFrequencyResource(1).GNBCarrierIndex).NumSlotsFrame + (timeFrequencyResource(1).NSlot-obj.CurrSlot);
+                    % Fill other details of grants: slot offset from current slot, grant type
+                    % (newTx or reTx), HARQ ID, NDI flag, RV, DMRS length, Number of CDM groups
+                    % without data
+                    for i=1:numel(newTxULGrants)
+                        newTxULGrants(i).Type = 'newTx';
+                        if ~isfield(newTxULGrants(i), 'GNBCarrierIndex') || isempty(newTxULGrants(i).GNBCarrierIndex)
+                            newTxULGrants(i).GNBCarrierIndex = 1;
+                        end
+                        newTxULGrants(i).StartSymbol = ttiSymbols(newTxULGrants(i).GNBCarrierIndex, 1);
+                        newTxULGrants(i).NumSymbols = ttiSymbols(newTxULGrants(i).GNBCarrierIndex, 2);
+                        newTxULGrants(i).SlotOffset = slotOffset;
+                        newTxULGrants(i).MappingType = schedulerConfig.PUSCHMappingType;
+                        newTxULGrants(i).DMRSLength = obj.PUSCHDMRSLength;
+                        % Set number of CDM groups without data
+                        if newTxULGrants(i).NumSymbols > 1
+                            newTxULGrants(i).NumCDMGroupsWithoutData = 2;
+                        else
+                            newTxULGrants(i).NumCDMGroupsWithoutData = 1; % To ensure some REs for data
+                        end
+                        newTxULGrants(i).ResourceAllocationType = schedulerConfig.ResourceAllocationType;
+                        % Select one HARQ process, update its context to reflect grant
+                        ueContext = obj.UEContext(newTxULGrants(i).RNTI);
+                        selectedHarqId = ueContext.findFreeUEHarqProcess(obj.ULType, newTxULGrants(i).GNBCarrierIndex);
+                        carrierContext = ueContext.ComponentCarrier(newTxULGrants(i).GNBCarrierIndex);
+                        harqProcess = nr5g.internal.nrUpdateHARQProcess(carrierContext.HarqProcessesUL(selectedHarqId+1), 1);
+                        newTxULGrants(i).RV = harqProcess.RVSequence(harqProcess.RVIdx(1));
+                        newTxULGrants(i).HARQID = selectedHarqId; % Fill HARQ ID
+                        % Toggle the NDI for new transmission
+                        newTxULGrants(i).NDI = ~carrierContext.HarqNDIUL(selectedHarqId+1);
+                        % Calculate PRBSet for each grant. The PRBSet is sent as part of the grant for
+                        % runtime optimization. This saves the gNB and UE from re-calculating PRBSet
+                        % using grant details
+                        newTxULGrants(i).PRBSet = obj.calculateGrantPRBSet(newTxULGrants(i));
+                        % Set number of antenna ports as number of antennas on UE
+                        newTxULGrants(i).NumAntennaPorts = carrierContext.NumTransmitAntennas;
+                    end
+                    ulGrantsTTI = [ulGrantsTTI; newTxULGrants];
+                end
+            end
+        end
+
+        function dlAssignmentsTTI = assignDLResourceTTI(obj, timeFrequencyResource)
+            %assignDLResourceTTI Perform the downlink scheduling of a set of contiguous DL symbols representing a TTI, of the specified slot
+
+            dlAssignmentsTTI = repmat(obj.DLAssignmentInfoStruct, 1, 0);
+            ttiSymbols = zeros(numel(obj.CellConfig), 2); % StartSym and numSym
+            %% Schedule retransmissions independently for all the carriers.
+            % Schedule the retransmission of a packet on the same carrier as was
+            % used for original packet. For each carrier, keep track of remaining
+            % available resources for new transmissions
+            newTxCarrierIndices = []; % Maintains carrier indices eligible for newTx
+            numReTxAssignments = 0;
+            schedulingInfo = repmat(obj.SchedulingInfoStruct, numel(timeFrequencyResource), 1); % Initialize per-carrier schedulingInfo for newTx
+            for j=1:numel(timeFrequencyResource) % For each carrier
+                carrierIndex = timeFrequencyResource(j).GNBCarrierIndex;
+                % Initialize frequency resource for the carriers (Assume the all the RB/RBGs are available)
+                if obj.SchedulerConfig.ResourceAllocationType % RAT-1
+                    timeFrequencyResource(j).FrequencyResource = zeros(1, obj.CellConfig(carrierIndex).NumResourceBlocks);
+                else
+                    timeFrequencyResource(j).FrequencyResource = zeros(1, obj.UEContext(1).ComponentCarrier(carrierIndex).NumRBGs);
+                end
+                [reTxUEs, frequencyAllocationBitmap, reTxDLAssignments] = scheduleRetransmissionsDL(obj, timeFrequencyResource(j));
+                ueContext = obj.UEContext;
+                for i = 1: numel(reTxDLAssignments)
+                    reTxAssignment = reTxDLAssignments(i);
+                    % Calculate PRBSet for each grant. The PRBSet is sent as part of the grant
+                    % for runtime optimization. This saves the gNB and UE from re-calculating
+                    % PRBSet using grant details
+                    reTxDLAssignments(i).PRBSet = obj.calculateGrantPRBSet(reTxAssignment);
+                    ueInfo = ueContext(reTxAssignment.RNTI);
+                    % Clear the retransmission context for this HARQ process of the selected UE
+                    % to make it ineligible for retransmission assignments (Retransmission
+                    % context would again get set, if Rx fails again in future for this
+                    % retransmission assignment)
+                    ueInfo.clearRetransmissionContext(obj.DLType, reTxAssignment.HARQID, reTxAssignment.GNBCarrierIndex);
+                    numReTxAssignments = numReTxAssignments+1;
+                    dlAssignmentsTTI(numReTxAssignments,1) = reTxDLAssignments(i);
+                end
+                ttiSymbols(carrierIndex, :) = timeFrequencyResource(j).SymbolAllocation;
+                % Populate context for new transmissions for the carrier
+                if any(~frequencyAllocationBitmap) % If any RB is free in the carrier
+                    eligibleUEs = getNewTxEligibleUEs(obj, carrierIndex, obj.DLType, reTxUEs);
+                    if ~isempty(eligibleUEs) % If there are any eligible UEs
+                        newTxCarrierIndices(end+1) = j; % Store index of eligible carrier for newTx
+                        timeFrequencyResource(j).FrequencyResource = frequencyAllocationBitmap;
+                        numUEsRetx = numel(reTxUEs);
+                        % Maximum number of UEs which could be scheduled for new-Tx
+                        maxNumUEsNewTx = obj.SchedulerConfig.MaxNumUsersPerTTI - numUEsRetx;
+                        schedulingInfo(j).EligibleUEs = eligibleUEs;
+                        schedulingInfo(j).MaxNumUsersTTI = maxNumUEsNewTx;
+                    end
+                end
+            end
+            % Filter out carriers ineligible carriers for newTx
+            timeFrequencyResource = timeFrequencyResource(newTxCarrierIndices);
+            schedulingInfo = schedulingInfo(newTxCarrierIndices);
+
+            %% Schedule new transmissions jointly for all the carriers
+            if ~isempty(newTxCarrierIndices)
+                if obj.IsSingleCarrierFormatNewTxDL  % Signature supporting single carrier
+                    timeFrequencyResource = timeFrequencyResource(1);
+                    frequencyResource = timeFrequencyResource.FrequencyResource;
+                    timeResource = rmfield(timeFrequencyResource, 'FrequencyResource');
+                    newTxDLAssignments= scheduleNewTransmissionsDL(obj, timeResource, frequencyResource, schedulingInfo(1));
+                else % Signature supporting multiple carriers
+                    newTxDLAssignments= scheduleNewTransmissionsDL(obj, timeFrequencyResource, schedulingInfo);
+                end
+                if ~isempty(newTxDLAssignments)
+                    if obj.EnableSchedulingValidation
+                        % Validate generated scheduling assignments
+                        nr5g.internal.nrSchedulerValidation.validateDLAssignments(newTxDLAssignments, timeFrequencyResource, schedulingInfo, obj);
+                    end
+
+                    % Calculate offset of scheduled slot from the current slot
+                    frameOffset = (timeFrequencyResource(1).NFrame-obj.CurrFrame);
+                    slotOffset = frameOffset*obj.CellConfig(timeFrequencyResource(1).GNBCarrierIndex).NumSlotsFrame + (timeFrequencyResource(1).NSlot-obj.CurrSlot);
+                    % Fill other details of grants: slot offset from current slot, grant type
+                    % (newTx or reTx), HARQ ID, NDI flag, feedback slot offset, RV, DMRS
+                    % length, Number of CDM groups without data
+                    for i=1:numel(newTxDLAssignments)
+                        newTxDLAssignments(i).Type = 'newTx';
+                        if ~isfield(newTxDLAssignments(i), 'GNBCarrierIndex') || isempty(newTxDLAssignments(i).GNBCarrierIndex)
+                            newTxDLAssignments(i).GNBCarrierIndex = 1;
+                        end
+                        newTxDLAssignments(i).NumLayers = size(newTxDLAssignments(i).W, 1);
+                        newTxDLAssignments(i).StartSymbol = ttiSymbols(newTxDLAssignments(i).GNBCarrierIndex, 1);
+                        newTxDLAssignments(i).NumSymbols = ttiSymbols(newTxDLAssignments(i).GNBCarrierIndex, 2);
+                        newTxDLAssignments(i).SlotOffset = slotOffset;
+
+                        % Calculate offset of feedback Tx slot from the scheduled slot (k1).
+                        ueContext = obj.UEContext(newTxDLAssignments(i).RNTI);
+                        primaryCarrierIndex = ueContext.ConfiguredCarrier(1);
+                        feedbackSlot = getPDSCHFeedbackSlotOffset(obj, primaryCarrierIndex, slotOffset);
+
+                        newTxDLAssignments(i).FeedbackSlotOffset = feedbackSlot;
+                        newTxDLAssignments(i).MappingType = obj.SchedulerConfig.PDSCHMappingType;
+                        newTxDLAssignments(i).DMRSLength = obj.PDSCHDMRSLength;
+                        newTxDLAssignments(i).NumCDMGroupsWithoutData = 2;
+                        newTxDLAssignments(i).ResourceAllocationType = obj.SchedulerConfig.ResourceAllocationType;
+                        % Select one HARQ process, update its context to reflect grant
+                        selectedHarqId = ueContext.findFreeUEHarqProcess(obj.DLType, newTxDLAssignments(i).GNBCarrierIndex);
+                        carrierContext = ueContext.ComponentCarrier(newTxDLAssignments(i).GNBCarrierIndex);
+                        harqProcess = nr5g.internal.nrUpdateHARQProcess(carrierContext.HarqProcessesDL(selectedHarqId+1), 1);
+                        newTxDLAssignments(i).RV = harqProcess.RVSequence(harqProcess.RVIdx(1));
+                        newTxDLAssignments(i).HARQID = selectedHarqId; % Fill HARQ ID
+                        % Toggle the NDI for new transmission
+                        newTxDLAssignments(i).NDI = ~carrierContext.HarqNDIDL(selectedHarqId+1);
+                        % Calculate PRBSet for each grant. The PRBSet is sent as part of the grant
+                        % for runtime optimization. This saves the gNB and UE from re-calculating
+                        % PRBSet using grant details
+                        newTxDLAssignments(i).PRBSet = obj.calculateGrantPRBSet(newTxDLAssignments(i));
+                        % Set beam index
+                        newTxDLAssignments(i).BeamIndex = [];
+                    end
+                    dlAssignmentsTTI = [dlAssignmentsTTI; newTxDLAssignments];
+                end
+            end
+        end
+
+        function [reTxUEs, updatedFrequencyAllocation, dlAssignments] = scheduleRetransmissionsDL(obj, timeFrequencyResource)
+            %scheduleRetransmissionsDL Assign resources of a set of contiguous DL symbols representing a TTI, of the specified slot for downlink retransmissions
+            % Return the downlink assignments to the UEs which are allotted
+            % retransmission opportunity and the updated frequency-occupancy-status to
+            % convey what all frequency resources are used. All UEs are checked if they
+            % require retransmission for any of their HARQ processes. If there are
+            % multiple such HARQ processes for a UE then one HARQ process is selected
+            % randomly among those. All UEs get maximum 1 retransmission opportunity in
+            % a TTI
+
+            schedulerConfig = obj.SchedulerConfig;
+            carrierIndex = timeFrequencyResource.GNBCarrierIndex;
+            % Initialize frequency resources available for retransmissions
+            updatedFrequencyAllocation = timeFrequencyResource.FrequencyResource;
+
+            % Read information about time resource scheduled in this TTI
+            scheduledSlot = timeFrequencyResource.NSlot;
+            startSym = timeFrequencyResource.SymbolAllocation(1);
+            numSym = timeFrequencyResource.SymbolAllocation(2);
+
+            reTxGrantCount = 0;
+            isAssigned=0;
+            numUEs = obj.NumUEs;
+            % Store UEs which get retransmission opportunity
+            reTxUEs = zeros(numUEs, 1);
+            % Store retransmission DL assignments of this TTI
+            dlAssignments = repmat(obj.DLAssignmentInfoStruct, numUEs, 1);
+
+            % Create a random permutation of UE RNTIs, to define the order in which
+            % retransmission assignments would be done for this TTI
+            reTxAssignmentOrder = randperm(numUEs);
+
+            % Calculate offset of currently scheduled slot from the current slot
+            slotOffset = scheduledSlot - obj.CurrSlot;
+            if scheduledSlot < obj.CurrSlot
+                slotOffset = slotOffset + obj.CellConfig(carrierIndex).NumSlotsFrame; % Scheduled slot is in next frame
+            end
+
+            % Consider retransmission requirement of the UEs as per
+            % reTxAssignmentOrder
+            for i = 1:size(reTxAssignmentOrder,2) % For each UE
+                % Stop assigning resources if the allocations are done for maximum users
+                if reTxGrantCount >= schedulerConfig.MaxNumUsersPerTTI
+                    break;
+                end
+                selectedUE = reTxAssignmentOrder(i);
+                ueContext = obj.UEContext(selectedUE);
+                carrierContext = ueContext.ComponentCarrier(carrierIndex);
+                reTxContextUE = carrierContext.RetransmissionContextDL;
+                failedRxHarqs = find(reTxContextUE==1);
+                if ~isempty(failedRxHarqs)
+                    % Select one HARQ process randomly
+                    selectedHarqId = failedRxHarqs(randi(size(failedRxHarqs,2)))-1;
+                    % Read TBS. Retransmission grant TBS also needs to be big enough to
+                    % accommodate the packet
+                    lastGrant = carrierContext.HarqStatusDL{selectedHarqId+1};
+                    % Select rank and precoding matrix as per the last transmission
+                    rank = lastGrant.NumLayers;
+                    W = lastGrant.W;
+
+                    % Non-adaptive retransmissions
+                    if schedulerConfig.ResourceAllocationType % RAT-1
+                        lastGrantNumSym = lastGrant.NumSymbols;
+                        lastGrantNumRBs = lastGrant.FrequencyAllocation(2);
+                        % Ensure that total REs are at least equal to REs in original grant
+                        numResourceBlocks = ceil(lastGrantNumSym*lastGrantNumRBs/numSym);
+                        startRBIndex = find(updatedFrequencyAllocation == 0, 1)-1;
+                        if numResourceBlocks <= (obj.CellConfig(carrierIndex).NumResourceBlocks-startRBIndex)
+                            % Retransmission TBS requirement have met
+                            isAssigned = 1;
+                            frequencyAllocation = [startRBIndex numResourceBlocks];
+                            mcs = lastGrant.MCSIndex;
+                            % Mark the allotted resources as occupied
+                            updatedFrequencyAllocation(startRBIndex+1:startRBIndex+numResourceBlocks) = 1;
+                        end
+                    else % RAT-0
+                        % Assign resources and MCS for retransmission
+                        [isAssigned, frequencyAllocation, mcs] = getRetxResourcesNonAdaptive(obj, selectedUE, ...
+                            updatedFrequencyAllocation, numSym, lastGrant);
+                        if isAssigned % Mark the allotted resources as occupied
+                            updatedFrequencyAllocation = updatedFrequencyAllocation | frequencyAllocation;
+                        end
+                    end
+
+                    if isAssigned
+                        % Fill the retransmission downlink assignment properties
+                        grant = obj.DLAssignmentInfoStruct;
+                        grant.RNTI = selectedUE;
+                        grant.GNBCarrierIndex = carrierIndex;
+                        grant.Type = 'reTx';
+                        grant.HARQID = selectedHarqId;
+                        grant.ResourceAllocationType = schedulerConfig.ResourceAllocationType;
+                        grant.FrequencyAllocation = frequencyAllocation;
+                        grant.StartSymbol = startSym;
+                        grant.NumSymbols = numSym;
+                        grant.SlotOffset = slotOffset;
+                        grant.MCSIndex = mcs;
+                        grant.NDI = carrierContext.HarqNDIDL(selectedHarqId+1); % Fill same NDI (for retransmission)
+                        ueContext = obj.UEContext(grant.RNTI);
+                        primaryCarrierIndex = ueContext.ConfiguredCarrier(1);
+                        grant.FeedbackSlotOffset = getPDSCHFeedbackSlotOffset(obj, primaryCarrierIndex, slotOffset); % Feedback on primary carrier
+                        grant.DMRSLength = obj.PDSCHDMRSLength;
+                        grant.MappingType = schedulerConfig.PDSCHMappingType;
+                        grant.NumLayers = rank;
+                        grant.W = W;
+                        grant.NumCDMGroupsWithoutData = 2; % Number of CDM groups without data (1...3)
+                        grant.BeamIndex = [];
+
+                        % Set the RV
+                        harqProcessContext = carrierContext.HarqProcessesDL(selectedHarqId+1);
+                        harqProcess = nr5g.internal.nrUpdateHARQProcess(harqProcessContext, 1);
+                        grant.RV = harqProcess.RVSequence(harqProcess.RVIdx(1));
+
+                        reTxGrantCount = reTxGrantCount+1;
+                        reTxUEs(reTxGrantCount) = selectedUE;
+                        dlAssignments(reTxGrantCount) = grant;
+                        isAssigned = 0;
+                    end
+                end
+            end
+            reTxUEs = reTxUEs(1:reTxGrantCount);
+            dlAssignments = dlAssignments(1:reTxGrantCount); % Remove all empty elements
+        end
+
+        function [reTxUEs, updatedFrequencyAllocation, ulGrants] = scheduleRetransmissionsUL(obj, timeFrequencyResource)
+            %scheduleRetransmissionsUL Assign resources of a set of contiguous UL symbols representing a TTI, of the specified slot for uplink retransmissions
+            % Return the uplink grants to the UEs which are allotted
+            % retransmission opportunity and the updated frequency-occupancy-status to
+            % convey what all frequency resources are used. All UEs are checked if they
+            % require retransmission for any of their HARQ processes. If there are
+            % multiple such HARQ processes for a UE then one HARQ process is selected
+            % randomly among those. All UEs get maximum 1 retransmission opportunity in
+            % a TTI
+
+            schedulerConfig = obj.SchedulerConfig;
+            carrierIndex = timeFrequencyResource.GNBCarrierIndex;
+            % Initialize frequency resources available for retransmissions
+            updatedFrequencyAllocation = timeFrequencyResource.FrequencyResource;
+            % Read information about time resource scheduled in this TTI
+            scheduledSlot = timeFrequencyResource.NSlot;
+            startSym = timeFrequencyResource.SymbolAllocation(1);
+            numSym = timeFrequencyResource.SymbolAllocation(2);
+
+            reTxGrantCount = 0;
+            isAssigned = 0;
+            numUEs = obj.NumUEs;
+            % Store UEs which get retransmission opportunity
+            reTxUEs = zeros(numUEs, 1);
+            % Store retransmission UL grants of this TTI
+            ulGrants = repmat(obj.ULGrantInfoStruct, numUEs, 1);
+
+            % Create a random permutation of UE RNTIs, to define the order in which UEs
+            % would be considered for retransmission assignments for this scheduler run
+            reTxAssignmentOrder = randperm(numUEs);
+
+            % Calculate offset of scheduled slot from the current slot
+            slotOffset = scheduledSlot - obj.CurrSlot;
+            if scheduledSlot < obj.CurrSlot
+                slotOffset = slotOffset + obj.CellConfig(carrierIndex).NumSlotsFrame;
+            end
+
+            % Consider retransmission requirement of the UEs as per
+            % reTxAssignmentOrder
+            for i = 1:size(reTxAssignmentOrder,2)
+                % Stop assigning resources if the allocations are done for maximum users
+                if reTxGrantCount >= schedulerConfig.MaxNumUsersPerTTI
+                    break;
+                end
+                selectedUE = reTxAssignmentOrder(i);
+                ueContext = obj.UEContext(selectedUE);
+                carrierContext = ueContext.ComponentCarrier(carrierIndex);
+                reTxContextUE = carrierContext.RetransmissionContextUL;
+                failedRxHarqs = find(reTxContextUE==1);
+                if ~isempty(failedRxHarqs) % At least one UL HARQ process for UE requires retransmission
+                    % Select one HARQ process randomly
+                    selectedHarqId = failedRxHarqs(randi(size(failedRxHarqs,2)))-1;
+                    % Read the TBS of original grant. Retransmission grant TBS also needs to be
+                    % big enough to accommodate the packet.
+                    lastGrant = carrierContext.HarqStatusUL{selectedHarqId+1};
+                    % Select rank and precoding matrix for the UE
+                    rank = lastGrant.NumLayers;
+                    tpmi = lastGrant.TPMI;
+                    numAntennaPorts = lastGrant.NumAntennaPorts;
+
+                    % Non-adaptive retransmissions
+                    if schedulerConfig.ResourceAllocationType % RAT-1
+                        lastGrantNumSym = lastGrant.NumSymbols;
+                        lastGrantNumRBs = lastGrant.FrequencyAllocation(2);
+                        % Ensure that total REs are at least equal to REs in original grant
+                        numResourceBlocks = ceil(lastGrantNumSym*lastGrantNumRBs/numSym);
+                        startRBIndex = find(updatedFrequencyAllocation == 0, 1)-1;
+                        if numResourceBlocks <= (obj.CellConfig(carrierIndex).NumResourceBlocks-startRBIndex)
+                            % Retransmission TBS requirement have met
+                            isAssigned = 1;
+                            frequencyAllocation = [startRBIndex numResourceBlocks];
+                            mcs = lastGrant.MCSIndex;
+                            % Mark the allotted resources as occupied
+                            updatedFrequencyAllocation(startRBIndex+1:startRBIndex+numResourceBlocks) = 1;
+                        end
+                    else % RAT-0
+                        % Assign resources and MCS for retransmission
+                        [isAssigned, frequencyAllocation, mcs] = getRetxResourcesNonAdaptive(obj, selectedUE, ...
+                            updatedFrequencyAllocation, numSym, lastGrant);
+                        if isAssigned % Mark the allotted resources as occupied
+                            updatedFrequencyAllocation = updatedFrequencyAllocation | frequencyAllocation;
+                        end
+                    end
+
+                    if isAssigned
+                        % Fill the retransmission uplink grant properties
+                        grant = obj.ULGrantInfoStruct;
+                        grant.RNTI = selectedUE;
+                        grant.GNBCarrierIndex = carrierIndex;
+                        grant.Type = 'reTx';
+                        grant.HARQID = selectedHarqId;
+                        grant.ResourceAllocationType = schedulerConfig.ResourceAllocationType;
+                        grant.FrequencyAllocation = frequencyAllocation;
+                        grant.StartSymbol = startSym;
+                        grant.NumSymbols = numSym;
+                        grant.SlotOffset = slotOffset;
+                        grant.MCSIndex = mcs;
+                        grant.NDI = carrierContext.HarqNDIUL(selectedHarqId+1); % Fill same NDI (for retransmission)
+                        grant.DMRSLength = obj.PUSCHDMRSLength;
+                        grant.MappingType = schedulerConfig.PUSCHMappingType;
+                        grant.NumLayers = rank;
+                        grant.TPMI = tpmi;
+                        % Set number of CDM groups without data (1...3)
+                        if numSym > 1
+                            grant.NumCDMGroupsWithoutData = 2;
+                        else
+                            grant.NumCDMGroupsWithoutData = 1; % To ensure some REs for data
+                        end
+                        grant.NumAntennaPorts = numAntennaPorts;
+                        % Set the RV
+                        harqProcess = nr5g.internal.nrUpdateHARQProcess(carrierContext.HarqProcessesUL(selectedHarqId+1), 1);
+                        grant.RV = harqProcess.RVSequence(harqProcess.RVIdx(1));
+
+                        reTxGrantCount = reTxGrantCount+1;
+                        reTxUEs(reTxGrantCount) = selectedUE;
+                        ulGrants(reTxGrantCount) = grant;
+                        isAssigned = 0;
+                    end
+                end
+            end
+            reTxUEs = reTxUEs(1:reTxGrantCount);
+            ulGrants = ulGrants(1:reTxGrantCount); % Remove all empty elements
+        end
+
+        function updatedEligibleUEs = randomizeUEsSelection(~, eligibleUEs, uePriority, ueIndices)
+            %randomizeUEsSelection Randomize selection of UEs with same priority.
+            updatedEligibleUEs = eligibleUEs;
+            if ~isempty(ueIndices)
+                % Extract all UE indices with the same priority as the last selected UE.
+                [~,uePrioirtyIndices] = find(uePriority(ueIndices(end)) == uePriority);
+
+                % Determine the number of UEs in the selected list that can be replaced.
+                [~, idx]=intersect(ueIndices,uePrioirtyIndices);
+                numUEsToSchedule = numel(idx);
+
+                % Randomly select the UE indices for the final selection
+                updatedUEIndices = randperm(numel(uePrioirtyIndices),numUEsToSchedule);
+
+                % Add selected UEs to the list
+                updatedEligibleUEs = [eligibleUEs(ueIndices(1:end-numUEsToSchedule)) eligibleUEs(uePrioirtyIndices(updatedUEIndices))];
+            end
+        end
+
+        function k1 = getPDSCHFeedbackSlotOffset(obj, gNBCarrierIndex, PDSCHSlotOffset)
+            %getPDSCHFeedbackSlotOffset Calculate k1 i.e. slot offset of feedback (ACK/NACK) transmission from the PDSCH transmission slot
+
+            % PDSCH feedback is currently supported to be sent with at least 1 slot gap
+            % after Tx slot i.e k1=2 is the earliest possible value, subjected to the
+            % UL time availability. For FDD, k1 is set as 2 as every slot is a UL slot.
+            % For TDD, k1 is set to slot offset of first upcoming slot with UL symbols.
+            % Input 'PDSCHSlotOffset' is the slot offset of PDSCH transmission slot
+            % from the current slot
+            cellConfig = obj.CellConfig(gNBCarrierIndex);
+            if cellConfig.DuplexModeNumber % TDD
+                % Calculate offset of first slot containing UL symbols, from PDSCH transmission slot
+                k1 = 2;
+                while(k1 < cellConfig.NumSlotsFrame)
+                    slotIndex = mod(cellConfig.CurrDLULSlotIndex + PDSCHSlotOffset + k1, cellConfig.NumDLULPatternSlots);
+                    if find(cellConfig.DLULSlotFormat(slotIndex + 1, :) == obj.ULType, 1)
+                        break; % Found a slot with UL symbols
+                    end
+                    k1 = k1 + 1;
+                end
+            else % FDD
+                k1 = 2;
+            end
+        end
+
+        function eligibleUEsList = getNewTxEligibleUEs(obj, gNBCarrierIndex, linkDir, reTxUEs)
+            %getNewTxEligibleUEs Return the UEs eligible for getting resources for new transmission
+            % Eligible UEs must meet the criteria:
+            % (i) UE did not get retransmission opportunity in the current TTI
+            % (ii) UE must have requirement of resources
+            % (iii) UE must have at least one free HARQ process
+
+            noReTxUEs = setdiff([obj.UEContext.RNTI], reTxUEs, 'stable'); % UEs which did not get any re-Tx opportunity
+            numNoReTxUEs = size(noReTxUEs,2);
+            eligibleUEs = zeros(1,numNoReTxUEs);
+            numEligibleUEs = 0;
+            ueContext = obj.UEContext;
+            % Eliminate further the UEs which do not have free HARQ process
+            for i = 1:numNoReTxUEs
+                ueInfo = ueContext(noReTxUEs(i));
+                freeHarqId = ueInfo.findFreeUEHarqProcess(linkDir, gNBCarrierIndex);
+                if freeHarqId == -1
+                    % No HARQ process free on this UE, so not eligible
+                    continue;
+                end
+                if linkDir==0 % DL
+                    bufferAmount = ueInfo.BufferStatusDL;
+                else % UL
+                    bufferAmount = ueInfo.BufferStatusUL;
+                end
+                if bufferAmount == 0
+                    % UE does not require any resources
+                    continue;
+                end
+                numEligibleUEs = numEligibleUEs + 1;
+                eligibleUEs(numEligibleUEs) = noReTxUEs(i);
+            end
+            eligibleUEsList = eligibleUEs(1:numEligibleUEs);
+        end
+
+        function [bitsPerRB, rbRequirement] = calculateRBRequirement(obj, rnti, linkDir, numSym, rank)
+            %calculateRBRequirement Calculate the number of RBs required based on the currently queued data
+
+            ueContext = obj.UEContext(rnti);
+            carrierContext = ueContext.ComponentCarrier(1);
+            if linkDir==0 % DL
+                mcsIndex =  selectMCSIndexDL(obj, carrierContext.CSIMeasurementDL.CSIRS.CQI(1), rnti); % Assuming wideband CQI
+                mcsTable = obj.MCSTableDL;
+                bufferedBits = ueContext.BufferStatusDL*8;
+                dmrsConfig = obj.PDSCHConfig(rnti).DMRS;
+                xOh = carrierContext.XOverheadPDSCH;
+                cdmGroupsInUse = obj.CDMGroupsInUseDL;
+            else % UL
+                mcsIndex = carrierContext.CSIMeasurementUL.MCSIndex; % Assuming wideband CQI
+                mcsTable = obj.MCSTableUL;
+                bufferedBits = ueContext.BufferStatusUL*8;
+                dmrsConfig = obj.PUSCHConfig(rnti).DMRS;
+                xOh = 0;
+                cdmGroupsInUse = obj.CDMGroupsInUseUL;
+            end
+            mcsInfo = mcsTable(mcsIndex+1, :);
+            % Number of data RE in a PRB containing DM-RS
+            nDataRE = max(0,12-sum(cdmGroupsInUse)*(4+2*(dmrsConfig.DMRSConfigurationType==1)));
+            % Number of DM-RS containing symbols
+            numDMRSSymbols = (1+dmrsConfig.DMRSAdditionalPosition)*dmrsConfig.DMRSLength;
+            nREPerPRB = 12*(numSym-numDMRSSymbols) + nDataRE*numDMRSSymbols -xOh;
+            bitsPerRB = mcsInfo(3)*nREPerPRB*rank;
+            if bufferedBits > 3824
+                rbRequirement = ceil((bufferedBits+24)/bitsPerRB); % 24 bit CRC if TB size > 3824 bits (as per 3GPP TS 38.212)
+            else
+                rbRequirement = ceil((bufferedBits+16)/bitsPerRB); % 16 bit CRC if TB size <= 3824 bits (as per 3GPP TS 38.212)
+            end
+        end
+
+        function [isAssigned, allottedBitmap, mcs] = getRetxResourcesNonAdaptive(obj, rnti, ...
+                rbgOccupancyBitmap, numSym, lastGrant)
+            %getRetxResourcesNonAdaptive Assign the retransmission resources in a
+            %non-adaptive manner
+
+            isAssigned = 0;
+            mcs = 0;
+            ueContext = obj.UEContext(rnti);
+            carrierContext = ueContext.ComponentCarrier(lastGrant.GNBCarrierIndex);
+            numRBGs = carrierContext.NumRBGs;
+            allottedBitmap = zeros(1, numRBGs);
+
+            % Assume the rank and MCS to be similar as original transmission. Ensure
+            % that total REs are at least equal to REs in original grant
+            rbgBitmapLastGrant = lastGrant.FrequencyAllocation;
+            rbLastGrant = convertRBGBitmapToRBs(obj, rnti, lastGrant.GNBCarrierIndex, rbgBitmapLastGrant);
+            requiredNumRB = ceil((size(rbLastGrant,1)*lastGrant.NumSymbols)/numSym);
+            rgbSize = carrierContext.RBGSize;
+            requiredNumRBG = ceil(requiredNumRB/rgbSize);
+
+            % RBG set used in last grant
+            rbgLastGrant = find(rbgBitmapLastGrant == 1);
+            % Assign the RBGs of last grant (whichever are free)
+            freeRBGs = rbgLastGrant(rbgOccupancyBitmap(rbgLastGrant) == 0);
+            assignedRBGs = freeRBGs(1:min(requiredNumRBG, size(freeRBGs,2)));
+            rbgOccupancyBitmap(assignedRBGs) = 1;
+            allottedBitmap(assignedRBGs) = 1;
+            assignedNumRB = size(convertRBGBitmapToRBs(obj, rnti, lastGrant.GNBCarrierIndex, allottedBitmap),1);
+            % Calculate the number of RBGs required (if any) after above assignment
+            requiredNumRBG = ceil((requiredNumRB - assignedNumRB)/rgbSize);
+            if requiredNumRBG > 0
+                % If one or more RBGs cannot be repeated as per the last grant then assign
+                % equivalent number of RBGs somewhere else in the bandwidth. Start
+                % assigning first free RBG onwards
+
+                % Do not consider last RBG if the last RBG has lesser number of RB since it
+                % can result in lower tbs capability of grant
+                if mod(obj.CellConfig(lastGrant.GNBCarrierIndex).NumResourceBlocks, rgbSize)
+                    rbgOccupancyBitmap = rbgOccupancyBitmap(1:end-1);
+                end
+                freeRBGs = find(rbgOccupancyBitmap==0);
+                if size(freeRBGs,2) >= requiredNumRBG
+                    isAssigned = 1;
+                    assignedRBGs = [assignedRBGs freeRBGs(1:requiredNumRBG)];
+                    allottedBitmap(assignedRBGs) = 1;
+                    mcs = lastGrant.MCSIndex;
+                end
+            else
+                isAssigned = 1;
+                mcs = lastGrant.MCSIndex;
+            end
+        end
+
+        function [rank, W] = selectRankAndPrecodingMatrixDL(obj, rnti, csiMeasurement, numCSIRSPorts)
+            % %selectRankAndPrecodingMatrixDL Select rank and precoding matrix based on the channel measurements using CSI-RS or SRS
+            %   [RANK, W] = selectRankAndPrecodingMatrixDL(OBJ, RNTI,
+            %   CSIREPORT, SRSREPORT, NUMCSIRSPORTS) selects the rank and precoding
+            %   matrix for a UE.
+            %
+            %   RNTI is the RNTI of the connected UE
+            %
+            %   CSIMEASUREMENT Wideband DL channel measurement, as reported by the UE node based
+            %   on CSI-RS reception, and the wideband DL channel measurement extracted by the
+            %   gNB from the SRS, specified as a structure with these fields.
+            %       CSIRS — A structure with these fields:
+            %           RI — Rank indicator
+            %           PMISet — Precoder matrix indications (PMI) set
+            %           CQI — Channel quality indicator
+            %           W — Precoding matrix
+            %
+            %       SRS — A structure with these fields:
+            %           RI — Rank indicator
+            %           W — Precoding matrix
+            %           MCSIndex — Modulation and coding scheme index
+            %
+            %   RANK is the selected rank i.e. the number of transmission
+            %   layers
+            %
+            %   NUMCSIRSPORTS is number of CSI-RS ports for the UE
+            %
+            %   W is an array of size RANK-by-P-by-NPRG, where NPRG is the
+            %   number of PRGs in the carrier and P is the number of CSI-RS
+            %   ports. W defines a different precoding matrix of size
+            %   RANK-by-P for each PRG. The effective PRG bundle size
+            %   (precoder granularity) is Pd_BWP = ceil(NRB / NPRG). Valid
+            %   PRG bundle sizes are given in TS 38.214 Section 5.1.2.3, and
+            %   the corresponding values of NPRG, are as follows:
+            %   Pd_BWP = 2 (NPRG = ceil(NRB / 2))
+            %   Pd_BWP = 4 (NPRG = ceil(NRB / 4))
+            %   Pd_BWP = 'wideband' (NPRG = 1)
+            %
+            % Rank selection procedure followed: Select the advised rank in the CSI report
+            % Precoder selection procedure followed: Form the combined precoding matrix for
+            % all the PRGs in accordance with the CSI report.
+            %
+            % The function can be modified to return rank and precoding
+            % matrix of choice.
+
+            carrierIndex = 1;
+            if obj.SchedulerConfig.CSIMeasurementSignalDLType
+                report = csiMeasurement.SRS; % SRS based measurement report
+                if isempty(report)
+                    numPorts = obj.CellConfig(carrierIndex).NumTransmitAntennas;
+                    W = (ones(numPorts, 1)./sqrt(numPorts)).';
+                    rank = 1;
+                else
+                    W = report.W.';
+                    rank = report.RI;
+                end
+            else
+                report = csiMeasurement.CSIRS; % CSI-RS based measurement report
+                rank = report.RI;
+                if numCSIRSPorts == 1 || isempty(report.W)
+                    % Single antenna port or no PMI report received
+                    W = 1;
+                else
+                    carrierContext = obj.UEContext(rnti).ComponentCarrier(carrierIndex);
+                    numPRGs =  ceil(obj.CellConfig(carrierIndex).NumResourceBlocks/carrierContext.PrecodingGranularity);
+                    W = complex(zeros(rank, size(report.W,1), numPRGs,1));
+                    for i=1:numPRGs
+                        % W(:,:,i) = report.W.'; edit by anph44
+
+                            % --- SỬA LỖI MA TRẬN W SUBBAND ---
+                        if ismatrix(report.W)
+                            % Trường hợp Wideband (Ma trận 2D): Giữ nguyên logic cũ
+                            W(:,:,i) = report.W.';
+                        else
+                            % Trường hợp Subband (Ma trận 3D: NumTx x NumLayers x NumSubbands)
+                            % Cần chuyển vị 2 chiều đầu tiên: [2 1 3]
+                            wSub = permute(report.W, [2 1 3]);
+                            
+                            % Gán vào W. Lưu ý W sẽ trở thành ma trận 4 chiều nếu có nhiều báo cáo (i > 1)
+                            % Hoặc 3 chiều nếu chỉ có 1 báo cáo.
+                            if i == 1
+                                 W = wSub;
+                            else
+                                 % Nếu có nhiều report, cần ghép nối theo chiều thứ 4
+                                 W = cat(4, W, wSub);
+                            end
+                        end
+                    % ---------------------------------
+                    end
+                end
+            end
+        end
+
+        function [rank, tpmi, numAntennaPorts] = selectRankAndPrecodingMatrixUL(obj, csiReport, numSRSPorts)
+            %selectRankAndPrecodingMatrixUL Select rank and precoding matrix based on the UL CSI measurement for the UE
+            %   [RANK, TPMI, NumAntennaPorts] = selectRankAndPrecodingMatrixUL(OBJ, CSIREPORT, NUMSRSPORTS)
+            %   selects the rank and precoding matrix for a UE.
+            %
+            %   CSIREPORT is the SRS-based channel state information measurement for the UE. It is a
+            %   structure with the fields: RI, TPMI, CQI
+            %
+            %   NUMSRSPORTS Number of SRS ports used for CSI measurement
+            %
+            %   RANK is the selected rank i.e. the number of transmission
+            %   layers
+            %
+            %   TPMI is transmitted precoding matrix indicator over the
+            %   RBs of the bandwidth.
+            %
+            %   NUMANTENNAPORTS Number of antenna ports selected for the UE
+            %
+            % Rank selection procedure followed: Select the advised rank as
+            % per the CSI measurement
+            % Precoder selection procedure followed: Select the advised TPMI as
+            % per the CSI measurement
+            %
+            % The function can be modified to return rank and precoding
+            % matrix of choice.
+
+            carrierIndex = 1;
+            rank = csiReport.RI;
+            % Fill the TPMI for each RB by keeping same value of TPMI for all
+            % the RBs in the CSI subband
+            tpmi = zeros(1, obj.CellConfig(carrierIndex).NumResourceBlocks);
+            numSubbands = size(csiReport.TPMI,1);
+            subbandSize = ceil(obj.CellConfig(carrierIndex).NumResourceBlocks/numSubbands);
+            for i = 1:numSubbands-1
+                tpmi((i-1)*subbandSize+1 : i*subbandSize) = csiReport.TPMI(i);
+            end
+            tpmi((numSubbands-1)*subbandSize+1:end) = csiReport.TPMI(end);
+            numAntennaPorts = numSRSPorts;
+        end
+
+        function mcsRowIndex = getMCSIndex(obj, cqiIndex)
+            %getMCSIndex Returns the MCS row index.
+            %   If fixed-MCS is configured, return the configured MCS index
+            %   value, otherwise return based on cqi value
+
+            schedulerConfig = obj.SchedulerConfig;
+            fixedMCS = schedulerConfig.FixedMCSIndexDL;
+            cqiTable = obj.CQITableDL;
+            mcsTable = obj.MCSTableDL;
+
+            if isempty(fixedMCS) % Channel-dependent MCS
+                modulation = cqiTable(cqiIndex + 1, 1);
+                codeRate = cqiTable(cqiIndex + 1, 2);
+
+                for mcsRowIndex = 1:28 % MCS indices
+                    if modulation ~= mcsTable(mcsRowIndex, 1)
+                        continue;
+                    end
+                    if codeRate <= mcsTable(mcsRowIndex, 2)
+                        break;
+                    end
+                end
+                mcsRowIndex = mcsRowIndex - 1;
+            else % Fixed MCS
+                mcsRowIndex = fixedMCS;
+            end
+        end
+
+        function mcsRowIndex = selectMCSIndexDL(obj, cqiIndex, eligibleUE)
+            %selectMCSIndexDL Returns the MCS row index based on channel measurement type
+
+            carrierIndex = 1;
+            if obj.SchedulerConfig.CSIMeasurementSignalDLType && isempty(obj.SchedulerConfig.FixedMCSIndexDL)
+                carrierContext = obj.UEContext(eligibleUE).ComponentCarrier(carrierIndex);
+                % MCS corresponding to the measured SRS based downlink CSI
+                if isempty(carrierContext.CSIMeasurementDL.SRS)
+                    mcsRowIndex = getMCSIndex(obj, cqiIndex);
+                else
+                    mcsRowIndex = carrierContext.CSIMeasurementDL.SRS.MCSIndex;
+                end
+            else
+                % MCS corresponding to the CSI-RS based measurements
+                mcsRowIndex = getMCSIndex(obj, cqiIndex);
+            end
+        end
+
+        function rbSet = convertRBGBitmapToRBs(obj, rnti, gNBCarrierIndex, rbgBitmap)
+            %convertRBGBitmapToRBs Convert RBGBitmap to corresponding RB indices
+
+            rbgSize = obj.UEContext(rnti).ComponentCarrier(gNBCarrierIndex).RBGSize;
+            numResourceBlocks = obj.CellConfig(gNBCarrierIndex).NumResourceBlocks;
+
+            rbSet = -1*ones(numResourceBlocks, 1); % To store RB indices of last UL grant
+            for rbgIndex = 0:size(rbgBitmap,2)-1
+                if rbgBitmap(rbgIndex+1)
+                    % If the last RBG of BWP is assigned, then it
+                    % might not have the same number of RBs as other RBG.
+                    index = rbgSize*rbgIndex;
+                    if rbgIndex == (size(rbgBitmap,2)-1)
+                        rbSet(index+1:end) = index:numResourceBlocks-1 ;
+                    else
+                        rbSet((index+1):(index+rbgSize)) = index:(index+rbgSize-1);
+                    end
+                end
+            end
+            rbSet = rbSet(rbSet>=0);
+        end
+
+        function [servedBits, nREPerPRB] = tbsCapability(obj, resourceAssignment, linkDir)
+            %tbsCapability Calculate the served bits and number of PDSCH/PUSCH REs per PRB
+
+            rnti = resourceAssignment.RNTI;
+            mappingType = resourceAssignment.MappingType;
+            startSym = resourceAssignment.StartSymbol;
+            numSym = resourceAssignment.NumSymbols;
+            nLayers = resourceAssignment.NumLayers;
+            numCDMGroupsWithoutData = resourceAssignment.NumCDMGroupsWithoutData;
+
+            % Calculate grantRBs based on resource allocation type
+            if resourceAssignment.ResourceAllocationType % RAT-1
+                prbSet = resourceAssignment.FrequencyAllocation(1):resourceAssignment.FrequencyAllocation(1) + ...
+                    resourceAssignment.FrequencyAllocation(2) - 1;
+            else % RAT-0
+                prbSet = convertRBGBitmapToRBs(obj, rnti, resourceAssignment.GNBCarrierIndex, resourceAssignment.FrequencyAllocation);
+            end
+            if linkDir % Uplink
+                % Set up PUSCH configuration object. For runtime
+                % optimization, only set a field if its value is different
+                % from last PUSCH for the UE
+                puschConfig = obj.PUSCHConfig(rnti);
+                if startSym ~= puschConfig.SymbolAllocation(1) || numSym ~= puschConfig.SymbolAllocation(2)
+                    obj.PUSCHConfig(rnti).SymbolAllocation = [startSym numSym];
+                end
+                if mappingType ~= puschConfig.MappingType
+                    obj.PUSCHConfig(rnti).MappingType = mappingType;
+                end
+                if mappingType == 'A'
+                    dmrsAdditonalPos = obj.PUSCHDMRSAdditionalPosTypeA;
+                else
+                    dmrsAdditonalPos = obj.PUSCHDMRSAdditionalPosTypeB;
+                end
+                if dmrsAdditonalPos ~= puschConfig.DMRS.DMRSAdditionalPosition
+                    obj.PUSCHConfig(rnti).DMRS.DMRSAdditionalPosition = dmrsAdditonalPos;
+                end
+                if resourceAssignment.NumCDMGroupsWithoutData ~= puschConfig.DMRS.NumCDMGroupsWithoutData
+                    obj.PUSCHConfig(rnti).DMRS.NumCDMGroupsWithoutData = resourceAssignment.NumCDMGroupsWithoutData;
+                end
+                obj.PUSCHConfig(rnti).PRBSet = prbSet;
+
+                mcsInfo = obj.MCSTableUL(resourceAssignment.MCSIndex + 1, :);
+                modSchemeBits = mcsInfo(1); % Bits per symbol for modulation scheme
+                modScheme = nr5g.internal.getModulationScheme(modSchemeBits);
+                if puschConfig.Modulation ~= modScheme
+                    obj.PUSCHConfig(rnti).Modulation = modScheme;
+                end
+                obj.CarrierConfigUL.NSizeGrid = obj.CellConfig(resourceAssignment.GNBCarrierIndex).NumResourceBlocks;
+                [~, pxschIndicesInfo] = nrPUSCHIndices(obj.CarrierConfigUL, obj.PUSCHConfig(rnti));
+                % Overheads in PUSCH transmission
+                xOh = 0;
+            else % Downlink
+                % Set up PDSCH configuration object. For runtime
+                % optimization, only set a field if its value is different
+                % from last PDSCH for the UE
+                pdschConfig = obj.PDSCHConfig(rnti);
+                if startSym ~= pdschConfig.SymbolAllocation(1) || numSym ~= pdschConfig.SymbolAllocation(2)
+                    obj.PDSCHConfig(rnti).SymbolAllocation = [startSym numSym];
+                end
+                if mappingType ~= pdschConfig.MappingType
+                    obj.PDSCHConfig(rnti).MappingType = mappingType;
+                end
+                if mappingType == 'A'
+                    dmrsAdditonalPos = obj.PDSCHDMRSAdditionalPosTypeA;
+                else
+                    dmrsAdditonalPos = obj.PDSCHDMRSAdditionalPosTypeB;
+                end
+                if dmrsAdditonalPos ~= pdschConfig.DMRS.DMRSAdditionalPosition
+                    obj.PDSCHConfig(rnti).DMRS.DMRSAdditionalPosition = dmrsAdditonalPos;
+                end
+                if numCDMGroupsWithoutData ~= pdschConfig.DMRS.NumCDMGroupsWithoutData
+                    obj.PDSCHConfig(rnti).DMRS.NumCDMGroupsWithoutData = numCDMGroupsWithoutData;
+                end
+                obj.PDSCHConfig(rnti).PRBSet = prbSet;
+                mcsInfo = obj.MCSTableDL(resourceAssignment.MCSIndex + 1, :);
+                modSchemeBits = mcsInfo(1); % Bits per symbol for modulation scheme
+                modScheme = nr5g.internal.getModulationScheme(modSchemeBits);
+                if  obj.PDSCHConfig(rnti).Modulation ~= modScheme
+                    obj.PDSCHConfig(rnti).Modulation = modScheme;
+                end
+                obj.CarrierConfigDL.NSizeGrid = obj.CellConfig(resourceAssignment.GNBCarrierIndex).NumResourceBlocks;
+                [~, pxschIndicesInfo] = nrPDSCHIndices(obj.CarrierConfigDL, obj.PDSCHConfig(rnti));
+                xOh = obj.UEContext(rnti).ComponentCarrier(resourceAssignment.GNBCarrierIndex).XOverheadPDSCH;
+            end
+            codeRate = mcsInfo(2)/1024;
+            servedBits = nrTBS(modScheme, nLayers, numel(prbSet), ...
+                pxschIndicesInfo.NREPerPRB, codeRate, xOh);
+            nREPerPRB = pxschIndicesInfo.NREPerPRB;
+        end
+
+        function updateHARQContextDL(obj, grants)
+            %updateHARQContextDL Update DL HARQ context based on the grants
+
+            for grantIndex = 1:size(grants,1) % Update HARQ context
+                grant = grants(grantIndex);
+                obj.UEContext(grant.RNTI).updateHARQContextDL(grant);
+            end
+        end
+
+        function updateHARQContextUL(obj, grants)
+            %updateHARQContextUL Update UL HARQ context based on the grants
+
+            for grantIndex = 1:size(grants,1) % Update HARQ context
+                grant = grants(grantIndex);
+                obj.UEContext(grant.RNTI).updateHARQContextUL(grant);
+            end
+        end
+
+        function updateBufferStatusForGrants(obj, linkType, grants)
+            %updateBufferStatusForGrants Update the buffer status by
+            % reducing the UEs pending buffer amount based on the scheduled grants
+
+            for grantIdx = 1:size(grants,1)
+                resourceAssignment = grants(grantIdx);
+                if ~strcmp(resourceAssignment.Type, 'newTx') % Only consider newTx grants
+                    continue;
+                end
+                obj.UEContext(resourceAssignment.RNTI).updateBufferStatusForGrants(linkType, resourceAssignment.TBS);
+            end
+        end
+
+        function grantPRBSet = calculateGrantPRBSet(obj, grant)
+            %calculateGrantPRBSet Calcualte grant PRBSet based on the resource allocation type
+
+            frequencyAllocation = grant.FrequencyAllocation;
+            if obj.SchedulerConfig.ResourceAllocationType % RAT-1
+                startRBIndex = frequencyAllocation(1);
+                numGrantRBs = frequencyAllocation(2);
+                grantPRBSet(1:numGrantRBs) =  startRBIndex : (startRBIndex + numGrantRBs -1); % Store RB indices of the grant
+            else % RAT-0
+                grantPRBSet = convertRBGBitmapToRBs(obj, grant.RNTI, grant.GNBCarrierIndex, frequencyAllocation);
+            end
+        end
+
+        function [selectedUEs, selectedUEsMcs, W, pairingCache] = userPairingRAT0(obj, schedulerInput, eligibleUEs, ...
+                scheduledUE, scheduledUEIndex, mumimoUEs, pairingCache, rbgIndex, rbgIndexHistory, isDefaultCSI)
+            %userPairingRAT0 Get the paired UEs, MCS and precoders.
+            % The pairingCache as output is filled only for SRS-based DL
+            % MU-MIMO.
+
+            muMIMOConfigDL = obj.SchedulerConfig.MUMIMOConfigDL;
+            selectedUEs(1) = scheduledUE;
+            W = schedulerInput.W;
+            selectedUEsMcs = schedulerInput.mcsRBG(:, 1);
+            selectedUERank = schedulerInput.selectedRank(scheduledUEIndex);
+            selectedUEMcs = selectedUEsMcs(scheduledUEIndex);
+
+            % Get paired UE list for the primary user
+            if isDefaultCSI
+                % Run the CSI-RS-based user pairing
+                [selectedUEs, ~] = nr5g.internal.nrSelectPairedUEsCSIRS(schedulerInput, scheduledUE, selectedUEMcs, ...
+                    selectedUERank, mumimoUEs, muMIMOConfigDL, obj.UserPairingMatrix, obj.UEContext);
+                selectedUEs = selectedUEs(selectedUEs~=0);
+                pairingCache = [];
+            else
+                % Run the SRS-based user pairing
+                % Extract the non-zero RBG indices
+                rbgIndices = rbgIndexHistory(rbgIndexHistory ~= 0);
+                nonEmptyStatus = arrayfun(@(idx) ~isempty(pairingCache(idx).W), rbgIndices);
+                if any(nonEmptyStatus)
+                    lastNonEmptyIndex = rbgIndices(find(nonEmptyStatus, 1, 'last'));
+                    W = pairingCache(lastNonEmptyIndex).W;
+                    selectedUEsMcs = pairingCache(lastNonEmptyIndex).selectedUEsMcs;
+                end
+                % Check for any pairing history
+                hasPairingInfo = any(arrayfun(@(rbg) any(ismember(pairingCache(rbg).selectedUEs, selectedUEs)), rbgIndices));
+                if hasPairingInfo
+                    % Extract the non-zero RBG indices
+                    rbgIndices = rbgIndexHistory(rbgIndexHistory ~= 0);
+                    % Locate the first RBG index where we find a pairing history
+                    matchingRbgIndex = find(arrayfun(@(rbg) any(ismember(pairingCache(rbg).selectedUEs, scheduledUE)), rbgIndices), 1);
+                    if ~isempty(matchingRbgIndex)
+                        % Retrieve the actual RBG index
+                        matchingRBG = rbgIndices(matchingRbgIndex);
+                        % Retrieve the cached pairing information
+                        selectedUEs = pairingCache(matchingRBG).selectedUEs;
+                    end
+                else
+                    mumimoUEs = setdiff(mumimoUEs, [pairingCache.selectedUEs], 'stable');
+                    % Run the pairing algorithm
+                    [selectedUEs, V, pairedUEsMcs] = nr5g.internal.nrSelectPairedUEsSRS(schedulerInput, muMIMOConfigDL, scheduledUE, mumimoUEs);
+                    [~, idxPairedUEs] = ismember(selectedUEs, eligibleUEs);
+                    W(idxPairedUEs) = V;
+                    selectedUEsMcs(idxPairedUEs) = pairedUEsMcs;
+                end
+                if ~isDefaultCSI && (~hasPairingInfo || (hasPairingInfo && ~isempty(matchingRbgIndex)))
+                    % Update pairing history
+                    pairingCache(rbgIndex + 1).selectedUEs = selectedUEs;
+                    pairingCache(rbgIndex + 1).selectedUEsMcs = selectedUEsMcs;
+                    pairingCache(rbgIndex + 1).W = W;
+                end
+            end
+        end
+    end
+end
