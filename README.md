@@ -115,7 +115,7 @@ Open a terminal in the `/AI` directory and execute the training script. This wil
 ```bash
 cd AI
 pythonExpected Output: [TRAINER] Waiting for MATLAB at 127.0.0.1:5555...
-
+```
 ### Step 2: Start the MATLAB Simulation
 Open MATLAB, navigate to the /5G_Simulation directory, and run the main simulation script (e.g., NRCellPerformanceWithDownlinkMUMIMOExample.mlx). Ensure the scheduler configuration is set to use SchedulerDRL.
 
