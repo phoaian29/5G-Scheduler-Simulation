@@ -614,7 +614,9 @@ classdef nrGNB < wirelessnetwork.internal.nrNode
             numUEs = size(UE,2);
             srsResourcePeriodicity = obj.SRSReservedResource(2);
             % Maximum number of the connected UEs with the default SRS periodicity is 16 i.e., ktc(4)*ncsMax(4)
-            maxUEWithSRSPeriodicity = 16*(obj.SRSPeriodicityUE/srsResourcePeriodicity);
+            
+            % Edit by Anph44: 16 -> 512
+            maxUEWithSRSPeriodicity = 512*(obj.SRSPeriodicityUE/srsResourcePeriodicity);
 
             validSRSPeriodicity = [5 8 10 16 20 32 40 64 80 160 320 640 1280 2560];
             totalConnectedUEs = size(obj.ConnectedUEs,2)+numUEs;

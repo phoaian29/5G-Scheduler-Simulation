@@ -2,7 +2,7 @@
 
 % --- gNB CONFIGURATION (128T128R) ---
 gNBConfig = struct();
-gNBConfig.Position = [0 0 30];             % Vị trí [x,y,z]
+gNBConfig.Position = [0 0 0];             % Vị trí [x,y,z]
 gNBConfig.TransmitPower = 60;             % Công suất phát (dBm) ~ theo yêu cầu trung bình
 gNBConfig.SubcarrierSpacing = 30000;      % 30 kHz
 gNBConfig.CarrierFrequency = 4.9e9;       % 4.9 GHz
@@ -23,7 +23,6 @@ ueConfig.ReceiveGain = 0;                 % Gain 0 dBi
 ueConfig.MaxDistance = 1200;              % Bán kính 1200m
 ueConfig.MinDistance = 10;                
 ueConfig.AzimuthRange = [-30 30];         % Góc phương vị +/- 30 độ
-ueConfig.ElevationAngle = 0;    
 ueConfig.NoiseFigureMin = 8;              
 ueConfig.NoiseFigureMax = 30;             
 
@@ -77,7 +76,7 @@ muMIMOStruct = struct(...
     'MinNumRBs', muMIMOConfig.MinNumRBs, ...
     'SemiOrthogonalityFactor', muMIMOConfig.SemiOrthogonalityFactor, ...
     'MinCQI', muMIMOConfig.MinCQI, ...
-    'MaxNumLayers', muMIMOConfig.MaxNumLayers); 
+    'MaxNumLayers', muMIMOConfig.max); 
 
 % Khởi tạo SchedulerDRL (Yêu cầu bạn phải có file class SchedulerDRL.m)
 % Nếu chưa có, hãy dùng scheduler mặc định bằng cách comment dòng dưới

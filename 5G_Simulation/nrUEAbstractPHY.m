@@ -143,68 +143,68 @@ classdef nrUEAbstractPHY < nr5g.internal.nrUEPHY
                 estChannelGridIntf, pdschInfo, carrierConfigInfo);
         end
 
-        function [dlRank, pmiSet, cqi, precodingMatrix, sinr] = decodeCSIRS(obj, csirsConfig, pktStartTime, pktEndTime, carrierConfigInfo)
-            % Return CSI-RS measurment
-
-            % Get CSI-RS packet of interest and the interfering packets
-            [csirsPacket, interferingPackets] = packetListIntfBuffer(obj, obj.CSIRSPacketType, ...
-                pktStartTime, pktEndTime);
-
-            nVar = calculateThermalNoise(obj);
-            % Received power of gNB at UE for pathloss calculation
-            obj.GNBReceivedPower = csirsPacket.Power;
-
-            rnti = obj.RNTI; % Get the RNTI of the current UE
-
-            % Initialize packetOfInterest variable to store the matched CSI-RS packet
-            packetOfInterest = [];
-
-            % Loop over CSI-RS packets to find the one that matches the current UE's RNTI
-            for pktIdx = 1:numel(csirsPacket)
-                metadata = csirsPacket(pktIdx).Metadata;
-                rntiList = metadata.RNTI;
-                % Check if the current UE's RNTI matches any RNTI in the list
-                if any(rnti == rntiList)
-                    packetOfInterest = csirsPacket(pktIdx);
-                    break;
-                end
-            end
-
-            % Estimate channel for packet of interest and interferers
-            [estChannelGrid, estChannelGridIntf] = estimateChannelGrid(obj, packetOfInterest, ...
-                interferingPackets, carrierConfigInfo);
-
-            % Prepare LQM input for interferers
-            intf = prepareLQMInputIntf(obj, obj.L2SMIUI, interferingPackets, estChannelGridIntf, ...
-                carrierConfigInfo, nVar);
-
-            % Compute downlink rank and precoder based on the channel
-            if csirsConfig.NumCSIRSPorts > 1
-                [dlRank,pmiSet,pmiInfo] = nrRISelect(carrierConfigInfo, csirsConfig, ...
-                    obj.CSIReportConfig, estChannelGrid, nVar, 'MaxSE');
-            else
-                dlRank = 1;
-                pmiSet = struct(i1=[1 1 1], i2=1);
-                pmiInfo.W = 1;
-            end
-            blerThreshold = 0.1;
-            overhead = 0;
-            if obj.CSIReferenceResource.NumLayers ~= dlRank
-                obj.CSIReferenceResource.NumLayers = dlRank;
-            end
-            precodingMatrix = pmiInfo.W;
-            % For the given precoder prepare the LQM input
-
-            [obj.L2SMCSI, sig] = nr5g.internal.L2SM.prepareLQMInput(obj.L2SMCSI, ...
-                carrierConfigInfo,csirsConfig,estChannelGrid,nVar,pmiInfo.W.');
-            % Determine SINRs from Link Quality Model (LQM)
-            [obj.L2SMCSI, sinr] = nr5g.internal.L2SM.linkQualityModel(obj.L2SMCSI,sig,intf);
-            % CQI Selection
-            [obj.L2SMCSI, cqi, cqiInfo] = nr5g.internal.L2SM.cqiSelect(obj.L2SMCSI, ...
-                carrierConfigInfo,obj.CSIReferenceResource,overhead,sinr,obj.CQITableValues,blerThreshold);
-            cqi = max([cqi, 1]); % Ensure minimum CQI as 1
-            sinr = cqiInfo.EffectiveSINR;
-        end
+        % function [dlRank, pmiSet, cqi, precodingMatrix, sinr] = decodeCSIRS(obj, csirsConfig, pktStartTime, pktEndTime, carrierConfigInfo)
+        %     % Return CSI-RS measurment
+        % 
+        %     % Get CSI-RS packet of interest and the interfering packets
+        %     [csirsPacket, interferingPackets] = packetListIntfBuffer(obj, obj.CSIRSPacketType, ...
+        %         pktStartTime, pktEndTime);
+        % 
+        %     nVar = calculateThermalNoise(obj);
+        %     % Received power of gNB at UE for pathloss calculation
+        %     obj.GNBReceivedPower = csirsPacket.Power;
+        % 
+        %     rnti = obj.RNTI; % Get the RNTI of the current UE
+        % 
+        %     % Initialize packetOfInterest variable to store the matched CSI-RS packet
+        %     packetOfInterest = [];
+        % 
+        %     % Loop over CSI-RS packets to find the one that matches the current UE's RNTI
+        %     for pktIdx = 1:numel(csirsPacket)
+        %         metadata = csirsPacket(pktIdx).Metadata;
+        %         rntiList = metadata.RNTI;
+        %         % Check if the current UE's RNTI matches any RNTI in the list
+        %         if any(rnti == rntiList)
+        %             packetOfInterest = csirsPacket(pktIdx);
+        %             break;
+        %         end
+        %     end
+        % 
+        %     % Estimate channel for packet of interest and interferers
+        %     [estChannelGrid, estChannelGridIntf] = estimateChannelGrid(obj, packetOfInterest, ...
+        %         interferingPackets, carrierConfigInfo);
+        % 
+        %     % Prepare LQM input for interferers
+        %     intf = prepareLQMInputIntf(obj, obj.L2SMIUI, interferingPackets, estChannelGridIntf, ...
+        %         carrierConfigInfo, nVar);
+        % 
+        %     % Compute downlink rank and precoder based on the channel
+        %     if csirsConfig.NumCSIRSPorts > 1
+        %         [dlRank,pmiSet,pmiInfo] = nrRISelect(carrierConfigInfo, csirsConfig, ...
+        %             obj.CSIReportConfig, estChannelGrid, nVar, 'MaxSE');
+        %     else
+        %         dlRank = 1;
+        %         pmiSet = struct(i1=[1 1 1], i2=1);
+        %         pmiInfo.W = 1;
+        %     end
+        %     blerThreshold = 0.1;
+        %     overhead = 0;
+        %     if obj.CSIReferenceResource.NumLayers ~= dlRank
+        %         obj.CSIReferenceResource.NumLayers = dlRank;
+        %     end
+        %     precodingMatrix = pmiInfo.W;
+        %     % For the given precoder prepare the LQM input
+        % 
+        %     [obj.L2SMCSI, sig] = nr5g.internal.L2SM.prepareLQMInput(obj.L2SMCSI, ...
+        %         carrierConfigInfo,csirsConfig,estChannelGrid,nVar,pmiInfo.W.');
+        %     % Determine SINRs from Link Quality Model (LQM)
+        %     [obj.L2SMCSI, sinr] = nr5g.internal.L2SM.linkQualityModel(obj.L2SMCSI,sig,intf);
+        %     % CQI Selection
+        %     [obj.L2SMCSI, cqi, cqiInfo] = nr5g.internal.L2SM.cqiSelect(obj.L2SMCSI, ...
+        %         carrierConfigInfo,obj.CSIReferenceResource,overhead,sinr,obj.CQITableValues,blerThreshold);
+        %     cqi = max([cqi, 1]); % Ensure minimum CQI as 1
+        %     sinr = cqiInfo.EffectiveSINR;
+        % end
 
     %% anph44 modify function
         % function [dlRank, pmiSet, cqi, precodingMatrix, sinrEff] = decodeCSIRS(obj, csirsConfig, pktStartTime, pktEndTime, carrierConfigInfo)
@@ -367,6 +367,148 @@ classdef nrUEAbstractPHY < nr5g.internal.nrUEPHY
         %     end
         % 
         % end
+
+
+        function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubband] = decodeCSIRS(obj, csirsConfig, pktStartTime, pktEndTime, carrierConfigInfo)
+            % decodeCSIRS (Updated: Reporting both Wideband and Subband CQI)
+            % - Wideband CQI: Calculated via global SINR mapping
+            % - Subband CQI: Calculated per 4-PRB subband
+        
+            %========================
+            % 1) Khởi tạo và Lấy gói tin CSI-RS
+            %========================
+            [csirsPacket, interferingPackets] = packetListIntfBuffer(obj, obj.CSIRSPacketType, ...
+                pktStartTime, pktEndTime);
+        
+            nVar = calculateThermalNoise(obj);
+            
+            % Tìm gói tin của UE hiện tại (RNTI)
+            rnti = obj.RNTI;
+            packetOfInterest = [];
+            for pktIdx = 1:numel(csirsPacket)
+                metadata = csirsPacket(pktIdx).Metadata;
+                if any(rnti == metadata.RNTI)
+                    packetOfInterest = csirsPacket(pktIdx);
+                    break;
+                end
+            end
+        
+            if isempty(packetOfInterest)
+                dlRank = 1; pmiSet = struct('i1',[1 1 1],'i2',1);
+                widebandCQI = 1; cqiSubband = []; precodingMatrix = 1; sinrEffSubband = [];
+                return;
+            end
+        
+            %========================
+            % 2) Ước lượng kênh (Channel Estimation)
+            %========================
+            [estChannelGrid, estChannelGridIntf] = estimateChannelGrid(obj, packetOfInterest, ...
+                interferingPackets, carrierConfigInfo);
+        
+            %========================
+            % 3) Lựa chọn RI/PMI (Wideband)
+            %========================
+            if csirsConfig.NumCSIRSPorts > 1
+                [dlRank, pmiSet, pmiInfo] = nrRISelect(carrierConfigInfo, csirsConfig, ...
+                    obj.CSIReportConfig, estChannelGrid, nVar, 'MaxSE');
+            else
+                dlRank = 1; pmiSet = struct('i1',[1 1 1],'i2',1); pmiInfo.W = 1;
+            end
+            precodingMatrix = pmiInfo.W;
+        
+            % Chuẩn bị ma trận Precoding (wtxSB)
+            if ~ismatrix(pmiInfo.W)
+                W_input = permute(pmiInfo.W, [2 1 3]);
+            else
+                W_input = pmiInfo.W.';
+            end
+            wtxSB = W_input(:,:,1); % Force 2D
+        
+            % Cấu hình chung cho L2SM
+            blerThreshold = 0.1;
+            overhead = 0;
+            TotalRBs = double(carrierConfigInfo.NSizeGrid);
+        
+            %=========================================================
+            % 4) TÍNH WIDEBAND CQI (Đo SINR tổng thể -> Ánh xạ CQI)
+            %=========================================================
+            % Chuẩn bị LQM input cho toàn dải
+            l2smWB = nr5g.internal.L2SM.initialize(carrierConfigInfo);
+            
+            % Interference toàn dải
+            intfWB = prepareLQMInputIntf(obj, l2smWB, interferingPackets, estChannelGridIntf, ...
+                carrierConfigInfo, nVar);
+        
+            % Signal & SINR toàn dải
+            [l2smWB, sigWB] = nr5g.internal.L2SM.prepareLQMInput(l2smWB, ...
+                carrierConfigInfo, csirsConfig, estChannelGrid, nVar, wtxSB);
+            [l2smWB, sinrWB] = nr5g.internal.L2SM.linkQualityModel(l2smWB, sigWB, intfWB);
+        
+            % Ánh xạ trực tiếp SINR tổng thể sang Wideband CQI
+            csiRefWB = obj.CSIReferenceResource;
+            csiRefWB.PRBSet = 0:(TotalRBs-1);
+            [~, widebandCQI, ~] = nr5g.internal.L2SM.cqiSelect(l2smWB, ...
+                carrierConfigInfo, csiRefWB, overhead, sinrWB, obj.CQITableValues, blerThreshold);
+            
+            widebandCQI = max(widebandCQI, 1);
+        
+            %=========================================================
+            % 5) TÍNH SUBBAND CQI (Vòng lặp từng dải tần)
+            %=========================================================
+            SubbandSize = 16;
+            NumSubbands = ceil(TotalRBs / SubbandSize);
+            cqiSubband = zeros(1, NumSubbands);
+            sinrEffSubband = zeros(1, NumSubbands);
+        
+            expectedNsc = 12 * TotalRBs;
+            scDim = findDimBySize_nested(estChannelGrid, expectedNsc);
+        
+            for sbIdx = 1:NumSubbands
+                rbStart = (sbIdx - 1) * SubbandSize;
+                rbEnd   = min(sbIdx * SubbandSize, TotalRBs) - 1;
+                nRB_sb  = rbEnd - rbStart + 1;
+        
+                % Cắt Grid theo Subband
+                scStart = rbStart*12 + 1;
+                scEnd   = (rbEnd+1)*12;
+                estChSB     = sliceAlongDim_nested(estChannelGrid,     scDim, scStart, scEnd);
+                estChIntfSB = sliceAlongDim_nested(estChannelGridIntf, scDim, scStart, scEnd);
+        
+                % Cấu hình Carrier cho Subband
+                carrierSB = carrierConfigInfo;
+                carrierSB.NSizeGrid = double(nRB_sb);
+                carrierSB.NStartGrid = 0;
+        
+                l2smSB = nr5g.internal.L2SM.initialize(carrierSB);
+                intfSB = prepareLQMInputIntf(obj, l2smSB, interferingPackets, estChIntfSB, carrierSB, nVar);
+                [l2smSB, sigSB] = nr5g.internal.L2SM.prepareLQMInput(l2smSB, carrierSB, csirsConfig, estChSB, nVar, wtxSB);
+                [l2smSB, sinrSB] = nr5g.internal.L2SM.linkQualityModel(l2smSB, sigSB, intfSB);
+        
+                csiRefSB = obj.CSIReferenceResource;
+                csiRefSB.PRBSet = 0:(double(nRB_sb)-1);
+        
+                [~, cqiVal, cqiInfo] = nr5g.internal.L2SM.cqiSelect(l2smSB, ...
+                    carrierSB, csiRefSB, overhead, sinrSB, obj.CQITableValues, blerThreshold);
+        
+                cqiSubband(sbIdx) = max(cqiVal, 1);
+                sinrEffSubband(sbIdx) = cqiInfo.EffectiveSINR;
+            end
+        
+            % Hiển thị kết quả để debug
+            fprintf('UE %d: Wideband CQI = %d | Avg Subband CQI = %.2f\n', rnti, widebandCQI, mean(cqiSubband));
+        
+            %========================
+            % Helper Functions
+            %========================
+            function dim = findDimBySize_nested(A, targetSize)
+                sz = size(A); dim = find(sz == targetSize, 1, 'first');
+                if isempty(dim), dim = 0; end
+            end
+            function Y = sliceAlongDim_nested(X, dim, iStart, iEnd)
+                if isempty(X), Y = X; return; end
+                idx = repmat({':'}, 1, ndims(X)); idx{dim} = iStart:iEnd; Y = X(idx{:});
+            end
+        end
 
 
         %% 
