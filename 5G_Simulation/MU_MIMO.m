@@ -17,14 +17,15 @@ gNBConfig.SRSPeriodicity = 5;             % SRS Periodicity = 5 slots
 
 % --- UE CONFIGURATION ---
 ueConfig = struct();
-ueConfig.NumUEs = 512;                    % 512 UE
+ueConfig.NumUEs = 2;     
+ueConfig.NumTransmitAntennas = 4;
 ueConfig.NumReceiveAntennas = 4;          % 4 Anten thu mỗi UE
 ueConfig.ReceiveGain = 0;                 % Gain 0 dBi
 ueConfig.MaxDistance = 1200;              % Bán kính 1200m
 ueConfig.MinDistance = 10;                
 ueConfig.AzimuthRange = [-30 30];         % Góc phương vị +/- 30 độ
 ueConfig.ElevationAngle = 0;    
-ueConfig.NoiseFigureMin = 8;              
+ueConfig.NoiseFigureMin = 20;              
 ueConfig.NoiseFigureMax = 30;             
 
 % --- MU-MIMO & SCHEDULER ---
@@ -37,7 +38,7 @@ muMIMOConfig.MaxNumLayers = 16;
 schedulerConfig = struct();
 schedulerConfig.ResourceAllocationType = 0; % RB-based
 schedulerConfig.MaxNumUsersPerTTI = 64;     % Max 64 UE/TTI
-schedulerConfig.SignalType = "CSI-RS";         
+schedulerConfig.SignalType = "SRS";         
 
 % --- CHANNEL MODEL ---
 channelConfig = struct();
@@ -102,7 +103,7 @@ ueDistances = ueConfig.MinDistance + (ueConfig.MaxDistance - ueConfig.MinDistanc
 [xPos, yPos, zPos] = sph2cart(deg2rad(ueAzimuths), deg2rad(ueElevations), ueDistances);
 uePositions = [xPos yPos zPos] + gNBConfig.Position;
 
-fprintf('Khoi tao %d UEs (gNB: 128T128R, Ptx: %ddBm)...\n', ueConfig.NumUEs, gNBConfig.TransmitPower);
+fprintf('Khoi tao %d UEs (gNB: 32T32R, Ptx: %ddBm)...\n', ueConfig.NumUEs, gNBConfig.TransmitPower);
 
 for i = 1:ueConfig.NumUEs
     currentNoise = ueConfig.NoiseFigureMin + (ueConfig.NoiseFigureMax - ueConfig.NoiseFigureMin) * rand();
@@ -110,7 +111,8 @@ for i = 1:ueConfig.NumUEs
                   'Position', uePositions(i, :), ...
                   'NumReceiveAntennas', ueConfig.NumReceiveAntennas, ... 
                   'NoiseFigure', currentNoise, ... 
-                  'ReceiveGain', ueConfig.ReceiveGain);           
+                  'ReceiveGain', ueConfig.ReceiveGain, ...
+                  'NumTransmitAntennas',ueConfig.NumTransmitAntennas);           
 end
 
 connectUE(gNB, UEs, FullBufferTraffic="DL", CSIReportPeriodicity=10);

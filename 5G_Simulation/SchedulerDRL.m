@@ -220,7 +220,7 @@ classdef SchedulerDRL < nrScheduler
         DRL_Socket = [];
         
         % Cấu hình hệ thống
-        MaxUEs = 64;           % Hỗ trợ tối đa 64 UE
+        MaxUEs = 2;           % Hỗ trợ tối đa 64 UE
         SubbandSize = 16;       % Số PRB mỗi Subband
         
         % Metrics theo dõi
@@ -278,8 +278,8 @@ classdef SchedulerDRL < nrScheduler
             featDim = 5 + 2 * numSubbands;
             exportMatrix = zeros(obj.MaxUEs, featDim);
             
-            precodingMatrixMap = cell(obj.MaxUEs, 1);
-
+            % precodingMatrixMap = cell(obj.MaxUEs, 1);
+            
             for i = 1:length(eligibleUEs)
                 rnti = eligibleUEs(i);
                 if rnti > obj.MaxUEs, continue; end
@@ -294,6 +294,7 @@ classdef SchedulerDRL < nrScheduler
                    [dlRank, ~, wbCQI, sbCQI, W_out, ~] = obj.decodeCSIRS(...
                         csirsConfig, currentTime, currentTime + 1e-3, carrierCtx, numRBs);
                 else
+                    disp("FallBack")
                     dlRank = 1; wbCQI = 1; sbCQI = ones(1, numSubbands); W_out = 1;
                 end
                 
@@ -317,7 +318,20 @@ classdef SchedulerDRL < nrScheduler
                 f_rho_vec = zeros(1, numSubbands);
 
                 exportMatrix(rnti, :) = [f_R, f_h, f_d, f_b, f_o, f_g_vec, f_rho_vec];
+                % --- [NEW LOG] IN RA 7 FEATURES CỦA UE ĐẦU TIÊN (Active) ---
+                if f_b > 0 && i == 1 % Chỉ in log cho UE đầu tiên có buffer
+                    fprintf('\n--- [MATLAB SENDING UE %d] ---\n', rnti);
+                    fprintf('1. Tput (f_R):   %.4f\n', f_R);
+                    fprintf('2. Rank (f_h):   %.4f\n', f_h);
+                    fprintf('3. Delay (f_d):  %.4f\n', f_d);
+                    fprintf('4. Buffer (f_b): %.0f\n', f_b);
+                    fprintf('5. WB CQI (f_o): %.4f\n', f_o);
+                    fprintf('6. SB CQI (Vec): [%.2f, %.2f, ... size=%d]\n', f_g_vec(1), f_g_vec(2), length(f_g_vec));
+                    fprintf('7. Corr (Vec):   [%.2f, ...]\n', f_rho_vec(1));
+                    fprintf('-----------------------------\n');
+                end
             end
+
 
             % --- 2. GỬI SANG PYTHON ---
             payload.features = exportMatrix;
@@ -429,19 +443,83 @@ classdef SchedulerDRL < nrScheduler
         
         % --- HELPER FUNCTIONS ---
         % FIX: Thêm tham số numRBs vào hàm decodeCSIRS để tránh lỗi NSizeGrid
-        function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubband] = decodeCSIRS(obj, csirsConfig, pktStartTime, pktEndTime, carrierConfigInfo, numRBs)
+function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubband] = decodeCSIRS(obj, csirsConfig, pktStartTime, pktEndTime, carrierCtx, numRBs)
              
-             % Fallback logic nếu chưa có implementation PHY đầy đủ
-             % FIX: Dùng numRBs được truyền vào thay vì carrierConfigInfo.NSizeGrid
+             % 1. Lấy thông tin cấu hình ăng-ten
+             numTx = obj.CellConfig.NumTransmitAntennas;
              numSB = ceil(numRBs / obj.SubbandSize);
              
-             % Logic mặc định giả lập
-             dlRank = 1; 
-             pmiSet = []; 
-             widebandCQI = 15; % Giả lập kênh tốt
-             cqiSubband = ones(1, numSB) * 15; 
-             precodingMatrix = 1; 
-             sinrEffSubband = [];
+             % 2. Lấy báo cáo CSI thực tế từ UE Context (Được cập nhật bởi PHY)
+             % carrierCtx được truyền vào chính là obj.UEContext(rnti).ComponentCarrier(1)
+             csiReport = carrierCtx.CSIMeasurementDL.CSIRS;
+
+             % 3. Kiểm tra xem đã có báo cáo CSI chưa
+             if isempty(csiReport) || all(isnan(csiReport.CQI(:)))
+                 % --- FALLBACK (Nếu chưa có báo cáo nào - dùng giá trị mặc định) ---
+                 disp("Fallback")
+                 dlRank = 1; 
+                 pmiSet = []; 
+                 widebandCQI = 15; 
+                 cqiSubband = ones(1, numSB) * 15; 
+                 precodingMatrix = ones(1, numTx) ./ sqrt(numTx); 
+                 sinrEffSubband = [];
+             else
+                 % --- REAL DATA (Dùng dữ liệu thực) ---
+                 disp("RealData")
+                 % A. Xử lý CQI
+                 rawCQI = csiReport.CQI;
+                 if isempty(rawCQI)
+                     widebandCQI = 1; 
+                     cqiSubband = ones(1, numSB);
+                 elseif isscalar(rawCQI)
+                     % Nếu cấu hình Wideband CQI
+                     widebandCQI = rawCQI;
+                     cqiSubband = ones(1, numSB) * rawCQI;
+                 else
+                     % Nếu cấu hình Subband CQI
+                     widebandCQI = mean(rawCQI, 'all');
+                     cqiSubband = rawCQI(:).'; % Đảm bảo là row vector
+                     
+                     % Resize nếu kích thước không khớp (do cấu hình Subband khác nhau)
+                     if length(cqiSubband) ~= numSB
+                         % Đơn giản nhất là resize/resample
+                         % Ở đây dùng nội suy nearest neighbor để khớp kích thước
+                         cqiSubband = imresize(cqiSubband, [1 numSB], 'nearest');
+                     end
+                 end
+                 
+                 % B. Xử lý Rank (RI)
+                 if isempty(csiReport.RI)
+                     dlRank = 1;
+                 else
+                     dlRank = csiReport.RI;
+                 end
+                 
+                 % C. Xử lý Precoding Matrix (W)
+                 if isfield(csiReport, 'W') && ~isempty(csiReport.W)
+                     % W thường có kích thước (NumTx, NumLayers, NumSubbands) hoặc tương tự
+                     % Scheduler cần (NumLayers, NumTx) cho băng rộng hoặc RBG
+                     % Lấy W của subband đầu tiên hoặc trung bình (Simplified)
+                     W_raw = csiReport.W; 
+                     
+                     % Xử lý chiều (Dimensions)
+                     % Giả sử W_raw là (NumTx x NumLayers) cho Wideband
+                     if size(W_raw, 1) == numTx && size(W_raw, 2) == dlRank
+                         precodingMatrix = W_raw.'; % Chuyển vị thành (NumLayers x NumTx)
+                     elseif size(W_raw, 2) == numTx && size(W_raw, 1) == dlRank
+                         precodingMatrix = W_raw;   % Đã đúng chiều
+                     else
+                         % Fallback W nếu kích thước lạ
+                         precodingMatrix = ones(dlRank, numTx) ./ sqrt(numTx);
+                     end
+                 else
+                     % Fallback W nếu không có PMI
+                     precodingMatrix = ones(dlRank, numTx) ./ sqrt(numTx);
+                 end
+                 
+                 pmiSet = [];
+                 sinrEffSubband = [];
+             end
         end
 
         function rbgSize = getRBGSize(obj)
