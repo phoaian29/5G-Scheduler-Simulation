@@ -3,212 +3,139 @@ import json
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from rl_mac_env import project_scores_to_prbs, bytes_per_prb, jain_fairness
 
 class MatlabBridgeEnv(gym.Env):
-    def __init__(self, host='127.0.0.1', port=5555, prb_budget=51):
+    def __init__(self, host='127.0.0.1', port=5555, max_ues=64, n_rbg=18):
         super().__init__()
-        
-        # Configuration: 5 Features * 4 UEs = 20 input dimensions
-        self.obs_dim = 20 
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.obs_dim,), dtype=np.float32)
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32)
         
         self.host = host
         self.port = port
-        self.prb_budget = prb_budget
+        self.max_ues = max_ues
+        self.n_rbg = n_rbg  # Số lượng RBG (ví dụ: 18 cho 100MHz với RBG size lớn, hoặc cấu hình khác)
+        
+        # --- 1. STATE SPACE (Theo bài báo: Appendix B.2) ---
+        # Shape: (MaxUEs, 5 + 2*N_RBG)
+        # 5 scalar features + 2 vector features (Subband CQI & Correlation) mỗi UE
+        self.feature_dim = 5 + 2 * self.n_rbg
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, 
+            shape=(self.max_ues, self.feature_dim), 
+            dtype=np.float32
+        )
+        
+        # --- 2. ACTION SPACE (Theo bài báo: Appendix B.1 - 1LDS) ---
+        # Output: Logits cho mỗi RBG để chọn UE.
+        # Shape: (N_RBG, MaxUEs + 1). "+1" là cho hành động "No Allocation".
+        self.action_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.n_rbg, self.max_ues + 1),
+            dtype=np.float32
+        )
         
         self.sock = None
         self.conn = None
-        
         self.last_raw_state = None
-        self.current_step = 0 
-        self.matlab_finished = False 
-        
-        self.thr_ema_mbps = np.ones(4, dtype=float) * 1e-6
-        self.rho = 0.9 
-        self.max_mb_per_tti = (self.prb_budget * bytes_per_prb(28) * 8.0) / 1e6
-        # Receive timeout handling - increased for CSI RS processing
-        self._recv_timeouts = 0
-        self._recv_timeout_limit = 20  # Increased from 8 to 20 retries
-        
         self.setup_server()
 
     def setup_server(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.settimeout(300)  # 5-minute timeout for acceptance
         self.sock.bind((self.host, self.port))
         self.sock.listen(1)
-        print(f"[TRAINER] Waiting for MATLAB connection at {self.host}:{self.port}...")
+        print(f"[TRAINER] Waiting for MATLAB at {self.host}:{self.port}...")
         self.conn, addr = self.sock.accept()
-        # Increased timeout for CSI RS processing which takes longer
-        self.conn.settimeout(30)  # 30-second timeout for each receive attempt
-        print(f"[TRAINER] MATLAB connected from {addr}")
-        self.matlab_finished = False
+        print(f"[TRAINER] MATLAB connected: {addr}")
 
     def reset(self, seed=None, options=None):
-        if self.matlab_finished:
-            print("[INFO] MATLAB simulation already finished. Cannot reset.")
-            print("[STOP] Training should stop now via StopOnMatlabFinishedCallback.")
-            return np.zeros(self.obs_dim, dtype=np.float32), {}
-
-        # Just wait for initial state from MATLAB (no need to request)
-        print("[TRAINER] Waiting for initial state from MATLAB...")
+        print("[TRAINER] Waiting for initial state...")
         raw_state = self._recv_from_matlab()
-        
         if raw_state is None:
-            print("[ERROR] MATLAB connection closed immediately")
-            self.matlab_finished = True
-            return np.zeros(self.obs_dim, dtype=np.float32), {}
-
-        if 'prb_budget' in raw_state: 
-            self.prb_budget = int(raw_state['prb_budget'])
-            self.max_mb_per_tti = (self.prb_budget * bytes_per_prb(28) * 8.0) / 1e6
+            return np.zeros((self.max_ues, self.feature_dim), dtype=np.float32), {}
         
+        # Cập nhật số lượng RBG thực tế từ MATLAB nếu có
+        if 'num_subbands' in raw_state:
+            self.n_rbg = int(raw_state['num_subbands'])
+            # Lưu ý: Nếu n_rbg thay đổi động, gym space sẽ không khớp. 
+            # Tốt nhất là cố định n_rbg max (padding) hoặc cấu hình chuẩn ngay từ đầu.
+
         self.last_raw_state = raw_state
-        obs = self._compute_obs(raw_state)
-        self.thr_ema_mbps = np.ones(4, dtype=float) * 1e-6
-        self.current_step = 0
-        print("[TRAINER] Received initial state, starting training...")
+        obs = self._process_obs(raw_state)
         return obs, {}
 
     def step(self, action):
-        self.current_step += 1
+        # action shape: (N_RBG, MaxUEs + 1)
+        # Bài báo 1LDS: Chọn UE có logit lớn nhất tại mỗi RBG
         
-        prev_feats = np.array(self.last_raw_state['features']) 
-        backlog_vec = prev_feats[:, 0]
-        cqi_vec = prev_feats[:, 2]
+        # 1. Chuyển Logits thành Allocation Map
+        # allocation_map[rbg_idx] = ue_index (0..64), trong đó 0..63 là UE, 64 là None
+        selected_indices = np.argmax(action, axis=1)
         
-        mcs_vec = np.clip(cqi_vec * 1.8, 0, 28).astype(int) 
-        active_mask = (backlog_vec > 0).astype(int)
-        scores = np.clip(action, 0.0, 1.0)
+        # 2. Tính PRB Counts để gửi về MATLAB 
+        # (Vì MATLAB hiện tại dùng performRBGMapping dựa trên số lượng PRB)
+        # Chúng ta đếm số lần mỗi UE được chọn
+        ue_counts = np.zeros(self.max_ues, dtype=int)
+        for idx in selected_indices:
+            if idx < self.max_ues: # Nếu không phải là "No Allocation"
+                # Giả sử 1 RBG có kích thước chuẩn (ví dụ 16 PRB)
+                # Ta cần nhân với RBG Size để ra số PRB, hoặc gửi số RBG.
+                # Ở đây ta gửi số RBG counts, MATLAB cần nhân với rbgSize.
+                ue_counts[idx] += 1
         
-        try:
-            prbs_out, _, wasted_prbs, _ = project_scores_to_prbs(
-                scores, self.prb_budget, backlog_vec, mcs_vec, active_mask, training_mode=True
-            )
-        except Exception as e:
-            print(f"[ERROR] Failed to project scores to PRBs: {e}")
-            print(f"  scores: {scores}, budget: {self.prb_budget}, backlog: {backlog_vec}, mcs: {mcs_vec}, mask: {active_mask}")
-            raise
+        # Gửi về MATLAB (chuyển đổi thành PRB counts ước lượng)
+        # Lưu ý: MATLAB code của bạn đang mong đợi 'prbs' là số PRB, không phải số RBG.
+        # Bạn nên cập nhật MATLAB để nhận 'rbg_counts' hoặc nhân ở đây.
+        # Giả sử RBG Size = 16 (default 5G 100MHz)
+        est_prb_counts = ue_counts * 16 
         
-        if not self._send_to_matlab({"prbs": prbs_out.tolist()}):
-            print("[ERROR] Failed to send data to MATLAB. Connection closed.")
-            self.matlab_finished = True
-            return self._compute_obs(self.last_raw_state), 0.0, True, False, {
-                "cell_tput_Mb": 0.0,
-                "jain": 0.0,
-                "wasted_prbs": 0
-            }
+        if not self._send_to_matlab({"prbs": est_prb_counts.tolist()}):
+            return self._process_obs(self.last_raw_state), 0, True, False, {}
 
+        # 3. Nhận State mới
         next_raw_state = self._recv_from_matlab()
-        
         if next_raw_state is None:
-            print(f"[INFO] MATLAB simulation finished at step {self.current_step}")
-            self.matlab_finished = True
-            return self._compute_obs(self.last_raw_state), 0.0, True, False, {
-                "cell_tput_Mb": 0.0,
-                "jain": 0.0,
-                "wasted_prbs": 0
-            }
-
-        if 'prb_budget' in next_raw_state: self.prb_budget = int(next_raw_state['prb_budget'])
+            return self._process_obs(self.last_raw_state), 0, True, False, {}
+            
         self.last_raw_state = next_raw_state
+        obs = self._process_obs(next_raw_state)
         
-        served_bytes = np.array(next_raw_state['last_served'])
-        served_mb_tti = (served_bytes.sum() * 8.0) / 1e6
-        tput_norm = served_mb_tti / (self.max_mb_per_tti + 1e-12)
-        inst_rate_mbps = (served_bytes * 8.0) / 1e6 / 0.001 
-        self.thr_ema_mbps = self.rho * self.thr_ema_mbps + (1 - self.rho) * inst_rate_mbps
-        jain = jain_fairness(self.thr_ema_mbps)
+        # 4. Tính Reward (Giản lược)
+        served = np.array(next_raw_state.get('last_served', []))
+        reward = np.sum(np.log(served + 1e-6)) # Proportional Fair Proxy
         
-        reward = 1.0 * tput_norm + 0.2 * jain
-        next_obs = self._compute_obs(next_raw_state)
-        
-        info = {
-            "cell_tput_Mb": float(served_mb_tti),
-            "jain": float(jain),
-            "wasted_prbs": int(wasted_prbs)
-        }
-        
-        if self.current_step % 10 == 0:
-            print("-" * 60)
-            print(f"Step {self.current_step:04d} | Total Reward: {reward:.4f}")
-            print(f"[Input] PRB Budget: {self.prb_budget}")
-            print(f"   UE Buffer (Bytes): {backlog_vec.astype(int)}")
-            print(f"[Agent] Action Scores: {scores.round(2)}")
-            print(f"[Output] PRB Allocation: {prbs_out} | Wasted: {wasted_prbs}")
-            print("-" * 60)
+        return obs, float(reward), False, False, {}
 
-        return next_obs, float(reward), False, False, info
-
-    def _compute_obs(self, raw):
-        feats = np.array(raw['features']) 
-        obs_vec = []
-        MAX_BYTES = self.prb_budget * 1000.0 
-        for i in range(4):
-            obs_vec.append(np.clip(feats[i][0] / MAX_BYTES, 0, 1))  # Buffer size
-            obs_vec.append(np.clip(feats[i][1] / 1000.0, 0, 1))     # Throughput
-            obs_vec.append(np.clip(feats[i][2] / 15.0, 0, 1))       # CQI
-            obs_vec.append(np.clip(feats[i][3] / 4.0, 0, 1))        # Rank
-            obs_vec.append(np.clip(feats[i][4], 0, 1))              # Allocation ratio
-        return np.array(obs_vec, dtype=np.float32)
+    def _process_obs(self, raw):
+        # Raw features từ MATLAB: (MaxUEs, 5 + 2*Subbands)
+        # Đảm bảo khớp shape (MaxUEs, feature_dim)
+        feats = np.array(raw['features'], dtype=np.float32)
+        
+        # Padding hoặc cắt nếu số subbands không khớp config
+        current_dim = feats.shape[1]
+        target_dim = self.feature_dim
+        
+        if current_dim < target_dim:
+            # Pad với 0
+            padding = np.zeros((self.max_ues, target_dim - current_dim), dtype=np.float32)
+            feats = np.hstack([feats, padding])
+        elif current_dim > target_dim:
+            # Cắt bớt
+            feats = feats[:, :target_dim]
+            
+        return feats
 
     def _recv_from_matlab(self):
+        # (Giữ nguyên logic nhận JSON từ code cũ)
         buffer = ""
         while "\n" not in buffer:
             try:
                 data = self.conn.recv(4096)
                 if not data: return None
-                chunk = data.decode('utf-8')
-                buffer += chunk
-                # Debug: raw chunk received
-                print(f"[MATLAB->TRAINER RAW] {chunk.strip()}")
-                # Reset timeout counter after receiving any data
-                self._recv_timeouts = 0
-            except socket.timeout:
-                # Transient timeout: allow several retries before concluding MATLAB finished
-                self._recv_timeouts += 1
-                print(f"[TRAINER] recv timeout #{self._recv_timeouts}/{self._recv_timeout_limit}")
-                if self._recv_timeouts >= self._recv_timeout_limit:
-                    print("[TRAINER] recv timeout limit reached — treating MATLAB as finished")
-                    return None
-                else:
-                    continue
-            except Exception:
-                print("[TRAINER] unexpected exception during recv")
-                return None
-        line, _ = buffer.split("\n", 1)
-        try:
-            # Debug: full JSON line from MATLAB
-            print(f"[MATLAB->TRAINER LINE] {line}")
-            # Reset timeout counter on successful parse
-            self._recv_timeouts = 0
-            return json.loads(line)
-        except Exception as e:
-            print(f"[ERROR] Failed to parse JSON from MATLAB: {e} | line={line}")
-            return None
+                buffer += data.decode('utf-8')
+            except: return None
+        return json.loads(buffer.split("\n")[0])
 
     def _send_to_matlab(self, data):
         try:
-            payload = json.dumps(data)
-            # Debug: payload being sent to MATLAB
-            print(f"[TRAINER->MATLAB] {payload}")
-            self.conn.sendall((payload + "\n").encode('utf-8'))
+            self.conn.sendall((json.dumps(data) + "\n").encode('utf-8'))
             return True
-        except socket.timeout:
-            return False
-        except Exception:
-            return False
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        if 'sock' in state: del state['sock']
-        if 'conn' in state: del state['conn']
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self.sock = None
-        self.conn = None
+        except: return False
