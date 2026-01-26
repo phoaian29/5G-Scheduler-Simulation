@@ -524,7 +524,7 @@ classdef nrNodeValidation
                 % Validate fields
                 switch char(name)
                     case 'MaxNumUsersPaired'
-                        validateattributes(value, {'numeric'}, {'nonempty', 'scalar', 'integer', '>=', 2, '<=', 4}, 'MaxNumUsersPaired', 'MaxNumUsersPaired');
+                        validateattributes(value, {'numeric'}, {'nonempty', 'scalar', 'integer', '>=', 2, '<=', 12}, 'MaxNumUsersPaired', 'MaxNumUsersPaired');
                     case 'SemiOrthogonalityFactor'
                         validateattributes(value, {'numeric'}, {'nonempty', 'scalar', '>=', 0, '<=', 1}, 'SemiOrthogonalityFactor', 'SemiOrthogonalityFactor');
                     case 'MinNumRBs'

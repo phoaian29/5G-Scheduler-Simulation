@@ -13,9 +13,9 @@ def run_debug_server():
     server_socket.bind((HOST, PORT))
     server_socket.listen(1)
     
-    print(f"🚀 [PYTHON] Đang chờ MATLAB tại {HOST}:{PORT}...")
+    print(f"Python is waiting for MATLAB at: {HOST}:{PORT}...")
     conn, addr = server_socket.accept()
-    print(f"✅ MATLAB đã kết nối: {addr}\n")
+    print(f"MATLAB connected from: {addr}\n")
     
     conn.settimeout(1.0)
     buffer = ""
@@ -57,7 +57,7 @@ def run_debug_server():
                         print(f"--- [PYTHON RECEIVED UE {u+1}] ---")
                         print(f"1. Tput (f_R):     {f_R:.4f}")
                         print(f"2. Rank (f_h):     {f_h:.4f}")
-                        print(f"3. AllocRBs (f_d): {f_d:.4f} (Corrected Label)") 
+                        print(f"3. AllocRBs (f_d): {f_d:.4f}") 
                         print(f"4. Buffer (f_b):   {f_b:.0f}")
                         print(f"5. WB CQI (f_o):   {f_o:.4f}")
                         print(f"6. SB CQI (Vec):   [{f_g_vec[0]:.2f}, {f_g_vec[1]:.2f}.. size={len(f_g_vec)}]")
@@ -88,7 +88,7 @@ def run_debug_server():
             except socket.timeout:
                 continue
     except KeyboardInterrupt:
-        print("\n🛑 Dừng Server.")
+        print("\nServer stopped.")
     finally:
         if conn: conn.close()
         server_socket.close()

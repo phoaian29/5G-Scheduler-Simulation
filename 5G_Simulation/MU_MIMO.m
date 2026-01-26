@@ -17,7 +17,7 @@ gNBConfig.SRSPeriodicity = 5;             % SRS Periodicity = 5 slots
 
 % --- UE CONFIGURATION ---
 ueConfig = struct();
-ueConfig.NumUEs = 2;     
+ueConfig.NumUEs = 512;     
 ueConfig.NumTransmitAntennas = 4;
 ueConfig.NumReceiveAntennas = 4;          % 4 Anten thu mỗi UE
 ueConfig.ReceiveGain = 0;                 % Gain 0 dBi
@@ -30,7 +30,7 @@ ueConfig.NoiseFigureMax = 90;
 
 % --- MU-MIMO & SCHEDULER ---
 muMIMOConfig = struct();
-muMIMOConfig.MaxNumUsersPaired = 4;      % Ghép tối đa 4 UE
+muMIMOConfig.MaxNumUsersPaired = 12;      % Ghép tối đa 4 UE
 muMIMOConfig.MinNumRBs = 3;               % Min 3 RBs
 muMIMOConfig.SemiOrthogonalityFactor = 0.9; 
 muMIMOConfig.MinCQI = 1;                % Tương ứng CQI 1
@@ -38,7 +38,7 @@ muMIMOConfig.MaxNumLayers = 16;
 schedulerConfig = struct();
 schedulerConfig.ResourceAllocationType = 0; % RB-based
 schedulerConfig.MaxNumUsersPerTTI = 64;     % Max 64 UE/TTI
-schedulerConfig.SignalType = "SRS";         
+schedulerConfig.SignalType = "CSI-RS";         
 
 % --- CHANNEL MODEL ---
 channelConfig = struct();
@@ -49,7 +49,7 @@ channelConfig.Orientation = [60; 0; 0];     % Hướng anten gNB
 
 % --- SIMULATION CONTROL ---
 simConfig = struct();
-simConfig.NumFrameSimulation = 5;           % Chạy thử 2 khung (20ms) vì 512 UE rất nặng
+simConfig.NumFrameSimulation = 17;           % Chạy thử 2 khung (20ms) vì 512 UE rất nặng
 simConfig.EnableTraces = true;              
 
 %% ====================== 2. INITIALIZATION ======================
@@ -93,7 +93,7 @@ configureScheduler(gNB, ...
 
 % --- Create UEs ---
 UEs = nrUE.empty(0, ueConfig.NumUEs); 
-rng(42); 
+rng('shuffle'); 
 
 % Tạo vị trí UE theo Sector (-30 đến 30 độ)
 ueAzimuths = ueConfig.AzimuthRange(1) + (ueConfig.AzimuthRange(2) - ueConfig.AzimuthRange(1)) * rand(ueConfig.NumUEs, 1);

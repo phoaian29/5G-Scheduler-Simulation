@@ -222,7 +222,7 @@ classdef SchedulerDRL < nrScheduler
         % Cấu hình hệ thống
         MaxUEs = 2;           % Hỗ trợ tối đa 64 UE
         SubbandSize = 16;       % Số PRB mỗi Subband
-        
+        MaxNumLayers = 16;
         % Metrics theo dõi
         AvgThroughputMBps = []; 
         Rho = 0.9;
@@ -303,7 +303,7 @@ classdef SchedulerDRL < nrScheduler
                 % --- TÍNH TOÁN 7 FEATURES ---
                 f_R = obj.AvgThroughputMBps(rnti);
                 f_h = dlRank / 4.0;
-                f_d = 0;
+                f_d = obj.LastAllocRatio(rnti);
                 f_b = ueCtx.BufferStatusDL;
                 
                 cqiIdx = min(max(round(wbCQI), 1), 16);
@@ -323,7 +323,7 @@ classdef SchedulerDRL < nrScheduler
                     fprintf('\n--- [MATLAB SENDING UE %d] ---\n', rnti);
                     fprintf('1. Tput (f_R):   %.4f\n', f_R);
                     fprintf('2. Rank (f_h):   %.4f\n', f_h);
-                    fprintf('3. Delay (f_d):  %.4f\n', f_d);
+                    fprintf('3. Alloc RBG (f_d):  %.4f\n', f_d);
                     fprintf('4. Buffer (f_b): %.0f\n', f_b);
                     fprintf('5. WB CQI (f_o): %.4f\n', f_o);
                     fprintf('6. SB CQI (Vec): [%.2f, %.2f, ... size=%d]\n', f_g_vec(1), f_g_vec(2), length(f_g_vec));
@@ -348,16 +348,18 @@ classdef SchedulerDRL < nrScheduler
             % --- 4. UPDATE METRICS ---
             servedBytes = zeros(1, obj.MaxUEs);
             currentAlloc = zeros(1, obj.MaxUEs);
-            numRBGTotal = floor(numRBs / rbgSize);
+            numRBGTotal = ceil(numRBs / rbgSize) * obj.MaxNumLayers;
             
             for k = 1:length(allottedUEs)
                 ueID = allottedUEs(k);
                 numRBG = sum(freqAllocation(k,:));
+                numLayers = obj.getNumLayersFromW(W_final{k});
                 if numRBG > 0
                     mcs = mcsIndex(k);
                     bpp = obj.getBytesPerPRB(mcs);
                     servedBytes(ueID) = numRBG * rbgSize * bpp;
-                    currentAlloc(ueID) = numRBG / numRBGTotal;
+                    allocatedRBGs = numRBG * numLayers;
+                    currentAlloc(ueID) = allocatedRBGs / numRBGTotal;
                 end
             end
             
@@ -533,5 +535,23 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             if mcs<0,mcs=0;end; if mcs>28,mcs=28;end
             bpp = (effs(mcs+1) * 12 * 14 * 0.9) / 8;
         end
+
+
+        function numLayers = getNumLayersFromW(~, W)
+            if isempty(W)
+                numLayers = 1;
+                return
+            end
+            if isnumeric(W)
+                if isscalar(W)
+                    numLayers = 1;
+                else
+                    numLayers = size(W, 1);
+                end
+                return
+            end
+            numLayers = 1;
+        end
+
     end
 end
