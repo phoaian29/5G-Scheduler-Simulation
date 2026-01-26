@@ -222,12 +222,15 @@ classdef SchedulerDRL < nrScheduler
         % Cấu hình hệ thống
         MaxUEs = 2;           % Hỗ trợ tối đa 64 UE
         SubbandSize = 16;       % Số PRB mỗi Subband
+        MaxNumLayers = 16;      % Số layer MU-MIMO tối đa
         
         % Metrics theo dõi
         AvgThroughputMBps = []; 
         Rho = 0.9;
         LastServedBytes = [];
         LastAllocRatio = [];
+        LastSRSReport = [];
+        LastSRSUpdateTime = [];
         
         % Mapping Table: CQI to Spectral Efficiency (Approx)
         CQIToSE = [0.15 0.23 0.38 0.60 0.88 1.18 1.48 1.91 2.40 2.73 3.32 3.90 4.52 5.12 5.55 6.00];
@@ -262,6 +265,8 @@ classdef SchedulerDRL < nrScheduler
                 obj.AvgThroughputMBps = zeros(1, obj.MaxUEs);
                 obj.LastServedBytes = zeros(1, obj.MaxUEs);
                 obj.LastAllocRatio = zeros(1, obj.MaxUEs);
+                obj.LastSRSReport = cell(1, obj.MaxUEs);
+                obj.LastSRSUpdateTime = nan(1, obj.MaxUEs);
             end
 
             % --- 1. CHUẨN BỊ DỮ LIỆU (7 FEATURES) ---
@@ -286,24 +291,27 @@ classdef SchedulerDRL < nrScheduler
                 
                 ueCtx = obj.UEContext(rnti);
                 carrierCtx = ueCtx.ComponentCarrier(1);
-                csirsConfig = carrierCtx.CSIRSConfiguration;
-
-                % --- DECODE CSI ---
-                % Truyền thêm numRBs vào hàm decode để fallback nếu cần
-                if ~isempty(csirsConfig)
-                   [dlRank, ~, wbCQI, sbCQI, W_out, ~] = obj.decodeCSIRS(...
-                        csirsConfig, currentTime, currentTime + 1e-3, carrierCtx, numRBs);
+                % --- DECODE CSI (Ưu tiên SRS khi bật CSIMeasurementSignalDL = "SRS") ---
+                if obj.SchedulerConfig.CSIMeasurementSignalDLType
+                    [dlRank, wbCQI, sbCQI, W_out] = obj.decodeSRS(carrierCtx, numSubbands, rnti, currentTime);
                 else
-                    disp("FallBack")
-                    dlRank = 1; wbCQI = 1; sbCQI = ones(1, numSubbands); W_out = 1;
+                    csirsConfig = carrierCtx.CSIRSConfiguration;
+                    if ~isempty(csirsConfig)
+                       [dlRank, ~, wbCQI, sbCQI, W_out, ~] = obj.decodeCSIRS(...
+                            csirsConfig, currentTime, currentTime + 1e-3, carrierCtx, numRBs);
+                    else
+                        disp("FallBack")
+                        dlRank = 1; wbCQI = 1; sbCQI = ones(1, numSubbands); W_out = 1;
+                    end
                 end
                 
                 precodingMatrixMap{rnti} = W_out;
 
                 % --- TÍNH TOÁN 7 FEATURES ---
                 f_R = obj.AvgThroughputMBps(rnti);
-                f_h = dlRank / 4.0;
-                f_d = 0;
+                f_h = dlRank / obj.MaxNumLayers;
+                % Normalized number of already allocated RBGs across MU-MIMO layers (not delay)
+                f_d = obj.LastAllocRatio(rnti);
                 f_b = ueCtx.BufferStatusDL;
                 
                 cqiIdx = min(max(round(wbCQI), 1), 16);
@@ -323,7 +331,7 @@ classdef SchedulerDRL < nrScheduler
                     fprintf('\n--- [MATLAB SENDING UE %d] ---\n', rnti);
                     fprintf('1. Tput (f_R):   %.4f\n', f_R);
                     fprintf('2. Rank (f_h):   %.4f\n', f_h);
-                    fprintf('3. Delay (f_d):  %.4f\n', f_d);
+                    fprintf('3. Alloc RBG (f_d):  %.4f\n', f_d);
                     fprintf('4. Buffer (f_b): %.0f\n', f_b);
                     fprintf('5. WB CQI (f_o): %.4f\n', f_o);
                     fprintf('6. SB CQI (Vec): [%.2f, %.2f, ... size=%d]\n', f_g_vec(1), f_g_vec(2), length(f_g_vec));
@@ -348,16 +356,18 @@ classdef SchedulerDRL < nrScheduler
             % --- 4. UPDATE METRICS ---
             servedBytes = zeros(1, obj.MaxUEs);
             currentAlloc = zeros(1, obj.MaxUEs);
-            numRBGTotal = floor(numRBs / rbgSize);
+            numRBGTotal = ceil(numRBs / rbgSize) * obj.MaxNumLayers;
             
             for k = 1:length(allottedUEs)
                 ueID = allottedUEs(k);
                 numRBG = sum(freqAllocation(k,:));
+                numLayers = obj.getNumLayersFromW(W_final{k});
                 if numRBG > 0
                     mcs = mcsIndex(k);
                     bpp = obj.getBytesPerPRB(mcs);
                     servedBytes(ueID) = numRBG * rbgSize * bpp;
-                    currentAlloc(ueID) = numRBG / numRBGTotal;
+                    allocatedRBGs = numRBG * numLayers;
+                    currentAlloc(ueID) = allocatedRBGs / numRBGTotal;
                 end
             end
             
@@ -532,6 +542,73 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             effs = [0.15 0.23 0.38 0.60 0.88 1.18 1.48 1.91 2.40 2.73 3.32 3.90 4.52 5.12 5.55 6.07 6.23 6.50 6.70 6.90 7.00 7.10 7.20 7.30 7.35 7.40 7.45 7.48 7.50];
             if mcs<0,mcs=0;end; if mcs>28,mcs=28;end
             bpp = (effs(mcs+1) * 12 * 14 * 0.9) / 8;
+        end
+
+        function [dlRank, wbCQI, sbCQI, W_out] = decodeSRS(obj, carrierCtx, numSubbands, rnti, currentTime)
+            srsReport = carrierCtx.CSIMeasurementDL.SRS;
+            numTx = obj.CellConfig.NumTransmitAntennas;
+            hasCached = ~isempty(obj.LastSRSReport{rnti});
+            if isempty(srsReport)
+                if hasCached
+                    srsReport = obj.LastSRSReport{rnti};
+                    fprintf('[SRS] UE %d reuse cached SRS at t=%.6f (last update t=%.6f)\n', ...
+                        rnti, currentTime, obj.LastSRSUpdateTime(rnti));
+                else
+                    fprintf('[SRS] UE %d no SRS yet at t=%.6f, fallback defaults\n', rnti, currentTime);
+                    dlRank = 1;
+                    wbCQI = 1;
+                    sbCQI = ones(1, numSubbands);
+                    W_out = ones(1, numTx) ./ sqrt(numTx);
+                    return
+                end
+            elseif ~hasCached || ~isequaln(srsReport, obj.LastSRSReport{rnti})
+                obj.LastSRSReport{rnti} = srsReport;
+                obj.LastSRSUpdateTime(rnti) = currentTime;
+                fprintf('[SRS] UE %d update SRS at t=%.6f\n', rnti, currentTime);
+            else
+                fprintf('[SRS] UE %d SRS unchanged at t=%.6f (last update t=%.6f)\n', ...
+                    rnti, currentTime, obj.LastSRSUpdateTime(rnti));
+            end
+
+            if isfield(srsReport, 'RI') && ~isempty(srsReport.RI)
+                dlRank = srsReport.RI;
+            else
+                dlRank = 1;
+            end
+
+            if isfield(srsReport, 'W') && ~isempty(srsReport.W)
+                W_out = srsReport.W;
+            else
+                W_out = ones(dlRank, numTx) ./ sqrt(numTx);
+            end
+
+            if isfield(srsReport, 'MCSIndex') && ~isempty(srsReport.MCSIndex)
+                wbCQI = obj.mcsToCQI(srsReport.MCSIndex);
+            else
+                wbCQI = 1;
+            end
+            sbCQI = ones(1, numSubbands) * wbCQI;
+        end
+
+        function cqi = mcsToCQI(~, mcsIndex)
+            mcsIndex = min(max(round(mcsIndex), 0), 28);
+            cqi = max(1, min(15, ceil((mcsIndex / 28) * 15)));
+        end
+
+        function numLayers = getNumLayersFromW(~, W)
+            if isempty(W)
+                numLayers = 1;
+                return
+            end
+            if isnumeric(W)
+                if isscalar(W)
+                    numLayers = 1;
+                else
+                    numLayers = size(W, 1);
+                end
+                return
+            end
+            numLayers = 1;
         end
     end
 end

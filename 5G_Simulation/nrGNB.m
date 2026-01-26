@@ -1124,9 +1124,9 @@ classdef nrGNB < wirelessnetwork.internal.nrNode
                 MUMIMOConfigDL=[], LinkAdaptationConfigDL=[], LinkAdaptationConfigUL=[], RVSequence=obj(1).RVSequence, CSIMeasurementSignalDL="CSI-RS");
             % Default values for DL MU-MIMO config parameter
             mumimoConfigDLCSIRS = struct(MaxNumUsersPaired=2, SemiOrthogonalityFactor=0.75, ...
-                MinNumRBs=6, MinCQI=7, MaxNumLayers=8);
+                MinNumRBs=6, MinCQI=7, MaxNumLayers=16);
             mumimoConfigDLSRS = struct(MaxNumUsersPaired=2, MinNumRBs=6, ...
-                MaxNumLayers=8, MinSINR=10);
+                MaxNumLayers=16, MinSINR=10);
             % Default values for LA config parameter
             defaultLAConfigDL = struct(StepUp=0.27, StepDown=0.03, InitialOffset=0);
             defaultLAConfigUL = struct(StepUp=0.27, StepDown=0.03, InitialOffset=0);

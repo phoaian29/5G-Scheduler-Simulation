@@ -27,12 +27,12 @@ Located in the `AI` directory, the Python component hosts the DRL agent and the 
 ### 3.1. Observation Space (State)
 The state space represents the instantaneous condition of the network. The input to the Neural Network is a flattened vector of size `[N_UEs x 5]`. For a standard 4-UE scenario, the input dimension is 20.
 
-For each User Equipment (UE) *i*, the features are defined as follows:
-1.  **Buffer Status (Normalized):** The amount of data pending in the RLC buffer, normalized by the maximum estimated capacity.
-2.  **Average Throughput (Normalized):** Exponential Moving Average (EMA) of the UE's throughput, normalized by the maximum possible link rate.
-3.  **Wideband CQI (Normalized):** The average Channel Quality Indicator over the entire bandwidth (range 0-15), normalized to [0, 1].
-4.  **Rank Indicator (Normalized):** The MIMO rank (range 1-4), normalized to [0, 1].
-5.  **Allocation Ratio (Previous TTI):** The ratio of resources allocated to this UE in the previous transmission time interval.
+For each User Equipment (UE) *i*, the features are defined as follows (when `CSIMeasurementSignalDL="SRS"`, channel quality comes from SRS-based DL measurements):
+1.  **Average Throughput (Normalized):** Exponential Moving Average (EMA) of the UE's throughput, normalized by the maximum possible link rate.
+2.  **Rank Indicator (Normalized):** The MIMO rank (range 1-4), normalized to [0, 1].
+3.  **Normalized Number of Already Allocated RBGs:** The normalized count of RBGs allocated to the UE in the previous scheduling iteration across MU-MIMO layers. The normalization follows \(\hat{d}_u = d_u / d_{\max}\), with \(d_{\max} = \text{NumRBGs} \times \text{MaxNumLayers}\).
+4.  **Buffer Status (Normalized):** The amount of data pending in the RLC buffer, normalized by the maximum estimated capacity.
+5.  **Wideband CQI (Normalized):** The average Channel Quality Indicator over the entire bandwidth (range 0-15), normalized to [0, 1].
 
 ### 3.2. Action Space
 The action space is continuous, designed to output priority scores rather than direct resource blocks to reduce dimensionality.
