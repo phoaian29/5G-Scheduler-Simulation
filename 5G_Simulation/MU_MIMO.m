@@ -17,7 +17,7 @@ gNBConfig.SRSPeriodicity = 5;             % SRS Periodicity = 5 slots
 
 % --- UE CONFIGURATION ---
 ueConfig = struct();
-ueConfig.NumUEs = 512;     
+ueConfig.NumUEs = 2;     
 ueConfig.NumTransmitAntennas = 4;
 ueConfig.NumReceiveAntennas = 4;          % 4 Anten thu mỗi UE
 ueConfig.ReceiveGain = 0;                 % Gain 0 dBi
@@ -25,12 +25,12 @@ ueConfig.MaxDistance = 1200;              % Bán kính 1200m
 ueConfig.MinDistance = 10;                
 ueConfig.AzimuthRange = [-30 30];         % Góc phương vị +/- 30 độ
 ueConfig.ElevationAngle = 0;    
-ueConfig.NoiseFigureMin = 30;              
-ueConfig.NoiseFigureMax = 90;             
+ueConfig.NoiseFigureMin = 20;              
+ueConfig.NoiseFigureMax = 30;             
 
 % --- MU-MIMO & SCHEDULER ---
 muMIMOConfig = struct();
-muMIMOConfig.MaxNumUsersPaired = 12;      % Ghép tối đa 4 UE
+muMIMOConfig.MaxNumUsersPaired = 4;      % Ghép tối đa 4 UE
 muMIMOConfig.MinNumRBs = 3;               % Min 3 RBs
 muMIMOConfig.SemiOrthogonalityFactor = 0.9; 
 muMIMOConfig.MinCQI = 1;                % Tương ứng CQI 1
@@ -38,7 +38,7 @@ muMIMOConfig.MaxNumLayers = 16;
 schedulerConfig = struct();
 schedulerConfig.ResourceAllocationType = 0; % RB-based
 schedulerConfig.MaxNumUsersPerTTI = 64;     % Max 64 UE/TTI
-schedulerConfig.SignalType = "CSI-RS";         
+schedulerConfig.SignalType = "SRS";         
 
 % --- CHANNEL MODEL ---
 channelConfig = struct();
@@ -49,7 +49,7 @@ channelConfig.Orientation = [60; 0; 0];     % Hướng anten gNB
 
 % --- SIMULATION CONTROL ---
 simConfig = struct();
-simConfig.NumFrameSimulation = 17;           % Chạy thử 2 khung (20ms) vì 512 UE rất nặng
+simConfig.NumFrameSimulation = 5;           % Chạy thử 2 khung (20ms) vì 512 UE rất nặng
 simConfig.EnableTraces = true;              
 
 %% ====================== 2. INITIALIZATION ======================
@@ -73,12 +73,19 @@ gNB = nrGNB('Position', gNBConfig.Position, ...
 
 % --- Configure Scheduler ---
 % Chuẩn bị struct config cho Scheduler
-muMIMOStruct = struct(...
-    'MaxNumUsersPaired', muMIMOConfig.MaxNumUsersPaired, ...
-    'MinNumRBs', muMIMOConfig.MinNumRBs, ...
-    'SemiOrthogonalityFactor', muMIMOConfig.SemiOrthogonalityFactor, ...
-    'MinCQI', muMIMOConfig.MinCQI, ...
-    'MaxNumLayers', muMIMOConfig.MaxNumLayers); 
+if schedulerConfig.SignalType == "SRS"
+    muMIMOStruct = struct(...
+        'MaxNumUsersPaired', muMIMOConfig.MaxNumUsersPaired, ...
+        'MinNumRBs', muMIMOConfig.MinNumRBs, ...
+        'MaxNumLayers', muMIMOConfig.MaxNumLayers);
+else
+    muMIMOStruct = struct(...
+        'MaxNumUsersPaired', muMIMOConfig.MaxNumUsersPaired, ...
+        'MinNumRBs', muMIMOConfig.MinNumRBs, ...
+        'SemiOrthogonalityFactor', muMIMOConfig.SemiOrthogonalityFactor, ...
+        'MinCQI', muMIMOConfig.MinCQI, ...
+        'MaxNumLayers', muMIMOConfig.MaxNumLayers);
+end
 
 % Khởi tạo SchedulerDRL (Yêu cầu bạn phải có file class SchedulerDRL.m)
 % Nếu chưa có, hãy dùng scheduler mặc định bằng cách comment dòng dưới
@@ -93,7 +100,7 @@ configureScheduler(gNB, ...
 
 % --- Create UEs ---
 UEs = nrUE.empty(0, ueConfig.NumUEs); 
-rng('shuffle'); 
+rng(42); 
 
 % Tạo vị trí UE theo Sector (-30 đến 30 độ)
 ueAzimuths = ueConfig.AzimuthRange(1) + (ueConfig.AzimuthRange(2) - ueConfig.AzimuthRange(1)) * rand(ueConfig.NumUEs, 1);

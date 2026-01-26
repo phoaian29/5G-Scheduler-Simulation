@@ -222,15 +222,12 @@ classdef SchedulerDRL < nrScheduler
         % Cấu hình hệ thống
         MaxUEs = 2;           % Hỗ trợ tối đa 64 UE
         SubbandSize = 16;       % Số PRB mỗi Subband
-        MaxNumLayers = 16;      % Số layer MU-MIMO tối đa
-        
+        MaxNumLayers = 16;
         % Metrics theo dõi
         AvgThroughputMBps = []; 
         Rho = 0.9;
         LastServedBytes = [];
         LastAllocRatio = [];
-        LastSRSReport = [];
-        LastSRSUpdateTime = [];
         
         % Mapping Table: CQI to Spectral Efficiency (Approx)
         CQIToSE = [0.15 0.23 0.38 0.60 0.88 1.18 1.48 1.91 2.40 2.73 3.32 3.90 4.52 5.12 5.55 6.00];
@@ -259,14 +256,11 @@ classdef SchedulerDRL < nrScheduler
         function dlAssignments = scheduleNewTransmissionsDL(obj, timeFrequencyResource, schedulingInfo)
             eligibleUEs = schedulingInfo.EligibleUEs;
             if isempty(eligibleUEs), dlAssignments = struct([]); return; end
-
             % --- 0. KHỞI TẠO METRICS NẾU CHƯA CÓ ---
             if isempty(obj.AvgThroughputMBps)
                 obj.AvgThroughputMBps = zeros(1, obj.MaxUEs);
                 obj.LastServedBytes = zeros(1, obj.MaxUEs);
                 obj.LastAllocRatio = zeros(1, obj.MaxUEs);
-                obj.LastSRSReport = cell(1, obj.MaxUEs);
-                obj.LastSRSUpdateTime = nan(1, obj.MaxUEs);
             end
 
             % --- 1. CHUẨN BỊ DỮ LIỆU (7 FEATURES) ---
@@ -293,7 +287,7 @@ classdef SchedulerDRL < nrScheduler
                 carrierCtx = ueCtx.ComponentCarrier(1);
                 % --- DECODE CSI (Ưu tiên SRS khi bật CSIMeasurementSignalDL = "SRS") ---
                 if obj.SchedulerConfig.CSIMeasurementSignalDLType
-                    [dlRank, wbCQI, sbCQI, W_out] = obj.decodeSRS(carrierCtx, numSubbands, rnti, currentTime);
+                    [dlRank, wbCQI, sbCQI, W_out] = obj.decodeSRS(carrierCtx, numSubbands);
                 else
                     csirsConfig = carrierCtx.CSIRSConfiguration;
                     if ~isempty(csirsConfig)
@@ -304,13 +298,11 @@ classdef SchedulerDRL < nrScheduler
                         dlRank = 1; wbCQI = 1; sbCQI = ones(1, numSubbands); W_out = 1;
                     end
                 end
-                
                 precodingMatrixMap{rnti} = W_out;
 
                 % --- TÍNH TOÁN 7 FEATURES ---
                 f_R = obj.AvgThroughputMBps(rnti);
-                f_h = dlRank / obj.MaxNumLayers;
-                % Normalized number of already allocated RBGs across MU-MIMO layers (not delay)
+                f_h = dlRank / 4.0;
                 f_d = obj.LastAllocRatio(rnti);
                 f_b = ueCtx.BufferStatusDL;
                 
@@ -453,121 +445,16 @@ classdef SchedulerDRL < nrScheduler
         
         % --- HELPER FUNCTIONS ---
         % FIX: Thêm tham số numRBs vào hàm decodeCSIRS để tránh lỗi NSizeGrid
-function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubband] = decodeCSIRS(obj, csirsConfig, pktStartTime, pktEndTime, carrierCtx, numRBs)
-             
-             % 1. Lấy thông tin cấu hình ăng-ten
-             numTx = obj.CellConfig.NumTransmitAntennas;
-             numSB = ceil(numRBs / obj.SubbandSize);
-             
-             % 2. Lấy báo cáo CSI thực tế từ UE Context (Được cập nhật bởi PHY)
-             % carrierCtx được truyền vào chính là obj.UEContext(rnti).ComponentCarrier(1)
-             csiReport = carrierCtx.CSIMeasurementDL.CSIRS;
-
-             % 3. Kiểm tra xem đã có báo cáo CSI chưa
-             if isempty(csiReport) || all(isnan(csiReport.CQI(:)))
-                 % --- FALLBACK (Nếu chưa có báo cáo nào - dùng giá trị mặc định) ---
-                 disp("Fallback")
-                 dlRank = 1; 
-                 pmiSet = []; 
-                 widebandCQI = 15; 
-                 cqiSubband = ones(1, numSB) * 15; 
-                 precodingMatrix = ones(1, numTx) ./ sqrt(numTx); 
-                 sinrEffSubband = [];
-             else
-                 % --- REAL DATA (Dùng dữ liệu thực) ---
-                 disp("RealData")
-                 % A. Xử lý CQI
-                 rawCQI = csiReport.CQI;
-                 if isempty(rawCQI)
-                     widebandCQI = 1; 
-                     cqiSubband = ones(1, numSB);
-                 elseif isscalar(rawCQI)
-                     % Nếu cấu hình Wideband CQI
-                     widebandCQI = rawCQI;
-                     cqiSubband = ones(1, numSB) * rawCQI;
-                 else
-                     % Nếu cấu hình Subband CQI
-                     widebandCQI = mean(rawCQI, 'all');
-                     cqiSubband = rawCQI(:).'; % Đảm bảo là row vector
-                     
-                     % Resize nếu kích thước không khớp (do cấu hình Subband khác nhau)
-                     if length(cqiSubband) ~= numSB
-                         % Đơn giản nhất là resize/resample
-                         % Ở đây dùng nội suy nearest neighbor để khớp kích thước
-                         cqiSubband = imresize(cqiSubband, [1 numSB], 'nearest');
-                     end
-                 end
-                 
-                 % B. Xử lý Rank (RI)
-                 if isempty(csiReport.RI)
-                     dlRank = 1;
-                 else
-                     dlRank = csiReport.RI;
-                 end
-                 
-                 % C. Xử lý Precoding Matrix (W)
-                 if isfield(csiReport, 'W') && ~isempty(csiReport.W)
-                     % W thường có kích thước (NumTx, NumLayers, NumSubbands) hoặc tương tự
-                     % Scheduler cần (NumLayers, NumTx) cho băng rộng hoặc RBG
-                     % Lấy W của subband đầu tiên hoặc trung bình (Simplified)
-                     W_raw = csiReport.W; 
-                     
-                     % Xử lý chiều (Dimensions)
-                     % Giả sử W_raw là (NumTx x NumLayers) cho Wideband
-                     if size(W_raw, 1) == numTx && size(W_raw, 2) == dlRank
-                         precodingMatrix = W_raw.'; % Chuyển vị thành (NumLayers x NumTx)
-                     elseif size(W_raw, 2) == numTx && size(W_raw, 1) == dlRank
-                         precodingMatrix = W_raw;   % Đã đúng chiều
-                     else
-                         % Fallback W nếu kích thước lạ
-                         precodingMatrix = ones(dlRank, numTx) ./ sqrt(numTx);
-                     end
-                 else
-                     % Fallback W nếu không có PMI
-                     precodingMatrix = ones(dlRank, numTx) ./ sqrt(numTx);
-                 end
-                 
-                 pmiSet = [];
-                 sinrEffSubband = [];
-             end
-        end
-
-        function rbgSize = getRBGSize(obj)
-            numRBs = obj.CellConfig.NumResourceBlocks;
-            if numRBs <= 36, rbgSize = 2; elseif numRBs <= 72, rbgSize = 4;
-            elseif numRBs <= 144, rbgSize = 8; else, rbgSize = 16; end
-        end
-
-        function bpp = getBytesPerPRB(~, mcs)
-            effs = [0.15 0.23 0.38 0.60 0.88 1.18 1.48 1.91 2.40 2.73 3.32 3.90 4.52 5.12 5.55 6.07 6.23 6.50 6.70 6.90 7.00 7.10 7.20 7.30 7.35 7.40 7.45 7.48 7.50];
-            if mcs<0,mcs=0;end; if mcs>28,mcs=28;end
-            bpp = (effs(mcs+1) * 12 * 14 * 0.9) / 8;
-        end
-
-        function [dlRank, wbCQI, sbCQI, W_out] = decodeSRS(obj, carrierCtx, numSubbands, rnti, currentTime)
+        function [dlRank, wbCQI, sbCQI, W_out] = decodeSRS(obj, carrierCtx, numSubbands)
+            if (~isempty(srsReport))
             srsReport = carrierCtx.CSIMeasurementDL.SRS;
             numTx = obj.CellConfig.NumTransmitAntennas;
-            hasCached = ~isempty(obj.LastSRSReport{rnti});
             if isempty(srsReport)
-                if hasCached
-                    srsReport = obj.LastSRSReport{rnti};
-                    fprintf('[SRS] UE %d reuse cached SRS at t=%.6f (last update t=%.6f)\n', ...
-                        rnti, currentTime, obj.LastSRSUpdateTime(rnti));
-                else
-                    fprintf('[SRS] UE %d no SRS yet at t=%.6f, fallback defaults\n', rnti, currentTime);
-                    dlRank = 1;
-                    wbCQI = 1;
-                    sbCQI = ones(1, numSubbands);
-                    W_out = ones(1, numTx) ./ sqrt(numTx);
-                    return
-                end
-            elseif ~hasCached || ~isequaln(srsReport, obj.LastSRSReport{rnti})
-                obj.LastSRSReport{rnti} = srsReport;
-                obj.LastSRSUpdateTime(rnti) = currentTime;
-                fprintf('[SRS] UE %d update SRS at t=%.6f\n', rnti, currentTime);
-            else
-                fprintf('[SRS] UE %d SRS unchanged at t=%.6f (last update t=%.6f)\n', ...
-                    rnti, currentTime, obj.LastSRSUpdateTime(rnti));
+                dlRank = 1;
+                wbCQI = 1;
+                sbCQI = ones(1, numSubbands);
+                W_out = ones(1, numTx) ./ sqrt(numTx);
+                return
             end
 
             if isfield(srsReport, 'RI') && ~isempty(srsReport.RI)
@@ -577,8 +464,7 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             end
 
             if isfield(srsReport, 'W') && ~isempty(srsReport.W)
-                W_raw = srsReport.W;
-                W_out = obj.normalizeSRSW(W_raw, dlRank, numTx);
+                W_out = srsReport.W;
             else
                 W_out = ones(dlRank, numTx) ./ sqrt(numTx);
             end
@@ -591,34 +477,16 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             sbCQI = ones(1, numSubbands) * wbCQI;
         end
 
-
-        function cqi = mcsToCQI(~, mcsIndex)
-            mcsIndex = min(max(round(mcsIndex), 0), 28);
-            cqi = max(1, min(15, ceil((mcsIndex / 28) * 15)));
+        function rbgSize = getRBGSize(obj)
+            numRBs = obj.CellConfig.NumResourceBlocks;
+            if numRBs <= 36, rbgSize = 2; elseif numRBs <= 72, rbgSize = 4;
+            elseif numRBs <= 144, rbgSize = 8; else, rbgSize = 16; end
         end
 
-        function W_out = normalizeSRSW(~, W_raw, dlRank, numTx)
-            if isempty(W_raw)
-                W_out = ones(dlRank, numTx) ./ sqrt(numTx);
-                return
-            end
-
-            if isscalar(W_raw)
-                W_out = ones(dlRank, numTx) ./ sqrt(numTx);
-                return
-            end
-
-            if ndims(W_raw) >= 3
-                W_raw = W_raw(:, :, 1);
-            end
-
-            if size(W_raw, 1) == dlRank && size(W_raw, 2) == numTx
-                W_out = W_raw;
-            elseif size(W_raw, 1) == numTx && size(W_raw, 2) == dlRank
-                W_out = W_raw.';
-            else
-                W_out = ones(dlRank, numTx) ./ sqrt(numTx);
-            end
+        function bpp = getBytesPerPRB(~, mcs)
+            effs = [0.15 0.23 0.38 0.60 0.88 1.18 1.48 1.91 2.40 2.73 3.32 3.90 4.52 5.12 5.55 6.07 6.23 6.50 6.70 6.90 7.00 7.10 7.20 7.30 7.35 7.40 7.45 7.48 7.50];
+            if mcs<0,mcs=0;end; if mcs>28,mcs=28;end
+            bpp = (effs(mcs+1) * 12 * 14 * 0.9) / 8;
         end
 
 
@@ -637,5 +505,6 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             end
             numLayers = 1;
         end
+
     end
 end
