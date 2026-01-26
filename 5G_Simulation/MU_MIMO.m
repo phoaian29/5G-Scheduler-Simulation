@@ -25,8 +25,8 @@ ueConfig.MaxDistance = 1200;              % Bán kính 1200m
 ueConfig.MinDistance = 10;                
 ueConfig.AzimuthRange = [-30 30];         % Góc phương vị +/- 30 độ
 ueConfig.ElevationAngle = 0;    
-ueConfig.NoiseFigureMin = 20;              
-ueConfig.NoiseFigureMax = 30;             
+ueConfig.NoiseFigureMin = 30;              
+ueConfig.NoiseFigureMax = 90;             
 
 % --- MU-MIMO & SCHEDULER ---
 muMIMOConfig = struct();
@@ -49,7 +49,7 @@ channelConfig.Orientation = [60; 0; 0];     % Hướng anten gNB
 
 % --- SIMULATION CONTROL ---
 simConfig = struct();
-simConfig.NumFrameSimulation = 2;           % Chạy thử 2 khung (20ms) vì 512 UE rất nặng
+simConfig.NumFrameSimulation = 5;           % Chạy thử 2 khung (20ms) vì 512 UE rất nặng
 simConfig.EnableTraces = true;              
 
 %% ====================== 2. INITIALIZATION ======================
@@ -142,7 +142,7 @@ end
 
 % Visualizer
 metricsVisualizer = helperNRMetricsVisualizer(gNB, UEs, ...
-    'RefreshRate', 20, ... % Update ít lại để đỡ lag
+    'RefreshRate', 1000, ... % Update ít lại để đỡ lag
     'PlotSchedulerMetrics', true, ...
     'PlotPhyMetrics', false, ...
     'PlotCDFMetrics', true, ...
