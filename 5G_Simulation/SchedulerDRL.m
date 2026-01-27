@@ -323,7 +323,7 @@ classdef SchedulerDRL < nrScheduler
                 sb_cqi_idx = min(max(round(sbCQI), 1), 16);
                 f_g_vec = obj.CQIToSE(sb_cqi_idx) / 6.0;
                 
-                f_rho_vec = zeros(1, numSubbands);
+                f_rho_vec = obj.computeCrossCorrelation(precodingMatrixMap, eligibleUEs, rnti, numSubbands);
 
                 exportMatrix(rnti, :) = [f_R, f_h, f_d, f_b, f_o, f_g_vec, f_rho_vec];
                 % --- [NEW LOG] IN RA 7 FEATURES CỦA UE ĐẦU TIÊN (Active) ---
@@ -618,6 +618,63 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             else
                 W_out = ones(dlRank, numTx) ./ sqrt(numTx);
             end
+        end
+
+        function rho_vec = computeCrossCorrelation(obj, precodingMap, eligibleUEs, rnti, numSubbands)
+            rho_vec = zeros(1, numSubbands);
+            if isempty(eligibleUEs) || numel(eligibleUEs) < 2
+                return
+            end
+
+            candidateW = precodingMap{rnti};
+            if isempty(candidateW)
+                return
+            end
+
+            for m = 1:numSubbands
+                Pm_u = obj.getPrecodingSubband(candidateW, m);
+                if isempty(Pm_u)
+                    continue
+                end
+                maxCorr = 0;
+                for idx = 1:numel(eligibleUEs)
+                    otherUE = eligibleUEs(idx);
+                    if otherUE == rnti
+                        continue
+                    end
+                    otherW = precodingMap{otherUE};
+                    if isempty(otherW)
+                        continue
+                    end
+                    Pm_c = obj.getPrecodingSubband(otherW, m);
+                    if isempty(Pm_c)
+                        continue
+                    end
+                    corrMatrix = Pm_u' * Pm_c;
+                    colSum = sum(abs(corrMatrix), 1);
+                    kappa = max(colSum);
+                    maxCorr = max(maxCorr, kappa);
+                end
+                rho_vec(m) = maxCorr;
+            end
+        end
+
+        function Pm = getPrecodingSubband(~, W, subbandIdx)
+            if isempty(W)
+                Pm = [];
+                return
+            end
+            if isscalar(W)
+                Pm = W;
+                return
+            end
+            if ndims(W) >= 3
+                maxIdx = size(W, 3);
+                subbandIdx = min(subbandIdx, maxIdx);
+                Pm = W(:, :, subbandIdx);
+                return
+            end
+            Pm = W;
         end
 
         function numLayers = getNumLayersFromW(~, W)
