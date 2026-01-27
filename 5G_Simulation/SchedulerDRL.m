@@ -577,7 +577,8 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             end
 
             if isfield(srsReport, 'W') && ~isempty(srsReport.W)
-                W_out = srsReport.W;
+                W_raw = srsReport.W;
+                W_out = obj.normalizeSRSW(W_raw, dlRank, numTx);
             else
                 W_out = ones(dlRank, numTx) ./ sqrt(numTx);
             end
@@ -593,6 +594,30 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
         function cqi = mcsToCQI(~, mcsIndex)
             mcsIndex = min(max(round(mcsIndex), 0), 28);
             cqi = max(1, min(15, ceil((mcsIndex / 28) * 15)));
+        end
+
+        function W_out = normalizeSRSW(~, W_raw, dlRank, numTx)
+            if isempty(W_raw)
+                W_out = ones(dlRank, numTx) ./ sqrt(numTx);
+                return
+            end
+
+            if isscalar(W_raw)
+                W_out = ones(dlRank, numTx) ./ sqrt(numTx);
+                return
+            end
+
+            if ndims(W_raw) >= 3
+                W_raw = W_raw(:, :, 1);
+            end
+
+            if size(W_raw, 1) == dlRank && size(W_raw, 2) == numTx
+                W_out = W_raw;
+            elseif size(W_raw, 1) == numTx && size(W_raw, 2) == dlRank
+                W_out = W_raw.';
+            else
+                W_out = ones(dlRank, numTx) ./ sqrt(numTx);
+            end
         end
 
         function numLayers = getNumLayersFromW(~, W)
