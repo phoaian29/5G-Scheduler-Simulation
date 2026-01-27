@@ -626,6 +626,9 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
                 return
             end
 
+            if rnti > numel(precodingMap)
+                return
+            end
             candidateW = precodingMap{rnti};
             if isempty(candidateW)
                 return
@@ -640,6 +643,9 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
                 for idx = 1:numel(eligibleUEs)
                     otherUE = eligibleUEs(idx);
                     if otherUE == rnti
+                        continue
+                    end
+                    if otherUE > numel(precodingMap)
                         continue
                     end
                     otherW = precodingMap{otherUE};
