@@ -2,7 +2,7 @@
 
 % --- gNB CONFIGURATION (128T128R) ---
 gNBConfig = struct();
-gNBConfig.Position = [0 0 30];             % Vị trí [x,y,z]
+gNBConfig.Position = [0 0 30];            % Vị trí [x,y,z]
 gNBConfig.TransmitPower = 60;             % Công suất phát (dBm) ~ theo yêu cầu trung bình
 gNBConfig.SubcarrierSpacing = 30000;      % 30 kHz
 gNBConfig.CarrierFrequency = 4.9e9;       % 4.9 GHz
@@ -17,7 +17,7 @@ gNBConfig.SRSPeriodicity = 5;             % SRS Periodicity = 5 slots
 
 % --- UE CONFIGURATION ---
 ueConfig = struct();
-ueConfig.NumUEs = 2;     
+ueConfig.NumUEs = 16;     
 ueConfig.NumTransmitAntennas = 4;
 ueConfig.NumReceiveAntennas = 4;          % 4 Anten thu mỗi UE
 ueConfig.ReceiveGain = 0;                 % Gain 0 dBi
@@ -30,15 +30,15 @@ ueConfig.NoiseFigureMax = 30;
 
 % --- MU-MIMO & SCHEDULER ---
 muMIMOConfig = struct();
-muMIMOConfig.MaxNumUsersPaired = 4;      % Ghép tối đa 4 UE
+muMIMOConfig.MaxNumUsersPaired = 4;       % Ghép tối đa 4 UE
 muMIMOConfig.MinNumRBs = 3;               % Min 3 RBs
 muMIMOConfig.SemiOrthogonalityFactor = 0.9; 
-muMIMOConfig.MinCQI = 1;                % Tương ứng CQI 1
+muMIMOConfig.MinCQI = 1;                  % Tương ứng CQI 1
 muMIMOConfig.MaxNumLayers = 16;
 schedulerConfig = struct();
 schedulerConfig.ResourceAllocationType = 0; % RB-based
 schedulerConfig.MaxNumUsersPerTTI = 64;     % Max 64 UE/TTI
-schedulerConfig.SignalType = "SRS";         
+schedulerConfig.SignalType = "CSI-RS";         
 
 % --- CHANNEL MODEL ---
 channelConfig = struct();
@@ -49,7 +49,7 @@ channelConfig.Orientation = [60; 0; 0];     % Hướng anten gNB
 
 % --- SIMULATION CONTROL ---
 simConfig = struct();
-simConfig.NumFrameSimulation = 5;           % Chạy thử 2 khung (20ms) vì 512 UE rất nặng
+simConfig.NumFrameSimulation = 5;          
 simConfig.EnableTraces = true;              
 
 %% ====================== 2. INITIALIZATION ======================
@@ -72,7 +72,6 @@ gNB = nrGNB('Position', gNBConfig.Position, ...
     'NumResourceBlocks', gNBConfig.NumResourceBlocks);
 
 % --- Configure Scheduler ---
-% Chuẩn bị struct config cho Scheduler
 if schedulerConfig.SignalType == "SRS"
     muMIMOStruct = struct(...
         'MaxNumUsersPaired', muMIMOConfig.MaxNumUsersPaired, ...
@@ -87,8 +86,6 @@ else
         'MaxNumLayers', muMIMOConfig.MaxNumLayers);
 end
 
-% Khởi tạo SchedulerDRL (Yêu cầu bạn phải có file class SchedulerDRL.m)
-% Nếu chưa có, hãy dùng scheduler mặc định bằng cách comment dòng dưới
 drlScheduler = SchedulerDRL(); 
 
 configureScheduler(gNB, ...
@@ -102,7 +99,6 @@ configureScheduler(gNB, ...
 UEs = nrUE.empty(0, ueConfig.NumUEs); 
 rng(42); 
 
-% Tạo vị trí UE theo Sector (-30 đến 30 độ)
 ueAzimuths = ueConfig.AzimuthRange(1) + (ueConfig.AzimuthRange(2) - ueConfig.AzimuthRange(1)) * rand(ueConfig.NumUEs, 1);
 ueElevations = zeros(ueConfig.NumUEs, 1);
 ueDistances = ueConfig.MinDistance + (ueConfig.MaxDistance - ueConfig.MinDistance) * rand(ueConfig.NumUEs, 1);
@@ -149,7 +145,7 @@ end
 
 % Visualizer
 metricsVisualizer = helperNRMetricsVisualizer(gNB, UEs, ...
-    'RefreshRate', 1000, ... % Update ít lại để đỡ lag
+    'RefreshRate', 1000, ... 
     'PlotSchedulerMetrics', true, ...
     'PlotPhyMetrics', false, ...
     'PlotCDFMetrics', true, ...
@@ -193,7 +189,6 @@ end
 
 %% ====================== HELPER FUNCTION ======================
 function avgUEsPerRB = calculateAvgUEsPerRBDL(logInfo, numResourceBlocks, ratType, duplexMode)
-    % (Giữ nguyên hàm tính toán như phiên bản trước)
     if strcmp(duplexMode, 'TDD')
         timeStepLogs = logInfo.TimeStepLogs;
         freqAllocations = timeStepLogs(:, 5);
