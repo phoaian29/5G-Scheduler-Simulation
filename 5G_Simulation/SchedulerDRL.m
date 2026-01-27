@@ -323,11 +323,12 @@ classdef SchedulerDRL < nrScheduler
                 sb_cqi_idx = min(max(round(sbCQI), 1), 16);
                 f_g_vec = obj.CQIToSE(sb_cqi_idx) / 6.0;
                 
-                f_rho_vec = obj.computeCrossCorrelation(precodingMatrixMap, eligibleUEs, rnti, numSubbands);
+                scheduledUEs = eligibleUEs(1:i-1);
+                f_rho_vec = obj.computeCrossCorrelation(precodingMatrixMap, scheduledUEs, rnti, numSubbands);
 
                 exportMatrix(rnti, :) = [f_R, f_h, f_d, f_b, f_o, f_g_vec, f_rho_vec];
                 % --- [NEW LOG] IN RA 7 FEATURES CỦA UE ĐẦU TIÊN (Active) ---
-                if f_b > 0 && i == 1 % Chỉ in log cho UE đầu tiên có buffer
+                if i == 1 % Chỉ in log cho UE đầu tiên trong danh sách eligible
                     fprintf('\n--- [MATLAB SENDING UE %d] ---\n', rnti);
                     fprintf('1. Tput (f_R):   %.4f\n', f_R);
                     fprintf('2. Rank (f_h):   %.4f\n', f_h);
@@ -620,9 +621,9 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
             end
         end
 
-        function rho_vec = computeCrossCorrelation(obj, precodingMap, eligibleUEs, rnti, numSubbands)
+        function rho_vec = computeCrossCorrelation(obj, precodingMap, scheduledUEs, rnti, numSubbands)
             rho_vec = zeros(1, numSubbands);
-            if isempty(eligibleUEs) || numel(eligibleUEs) < 2
+            if isempty(scheduledUEs)
                 return
             end
 
@@ -640,11 +641,8 @@ function [dlRank, pmiSet, widebandCQI, cqiSubband, precodingMatrix, sinrEffSubba
                     continue
                 end
                 maxCorr = 0;
-                for idx = 1:numel(eligibleUEs)
-                    otherUE = eligibleUEs(idx);
-                    if otherUE == rnti
-                        continue
-                    end
+                for idx = 1:numel(scheduledUEs)
+                    otherUE = scheduledUEs(idx);
                     if otherUE > numel(precodingMap)
                         continue
                     end
